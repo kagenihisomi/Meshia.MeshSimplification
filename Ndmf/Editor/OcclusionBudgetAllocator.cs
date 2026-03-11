@@ -2,38 +2,86 @@
 
 #if ENABLE_MODULAR_AVATAR
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 
 namespace Meshia.MeshSimplification.Ndmf.Editor
 {
-    internal static class OcclusionBudgetAllocator
+    /// <summary>
+    /// Holds per-vertex visibility scores and world-space baked meshes produced by
+    /// <see cref="OcclusionBudgetAllocator.ComputeVisibilityScores"/>.
+    /// Used by <see cref="BudgetDebugGizmoDrawer"/> to draw the mesh heat-map overlay.
+    /// </summary>
+    internal sealed class OcclusionDebugData : IDisposable
     {
-        /// <summary>Weight of the directional visibility score in the combined result.</summary>
-        private const float RayScoreWeight = 0.7f;
-
-        /// <summary>Weight of the bounds-containment heuristic score in the combined result.</summary>
-        private const float BoundsScoreWeight = 0.3f;
+        /// <summary>World-space baked mesh per renderer (vertices are in world space).</summary>
+        public readonly Dictionary<Renderer, Mesh> BakedMeshes = new();
 
         /// <summary>
-        /// Computes a visibility score [0,1] for each renderer owned by the simplifier.
-        /// 1.0 = fully visible, 0.0 = fully occluded.
-        /// Uses AABB-based directional sampling (no physics required, works in edit mode).
+        /// Per-vertex visibility score [0,1] for each renderer.
+        /// Array length equals <c>BakedMeshes[renderer].vertexCount</c>.
         /// </summary>
-        /// <param name="simplifier">The cascading simplifier component.</param>
-        /// <param name="raySampleCount">Number of ray-cast directions to sample. Default 256.</param>
-        /// <returns>Dictionary keyed by renderer's AvatarObjectReference.referencePath → visibility score.</returns>
-        public static Dictionary<string, float> ComputeVisibilityScores(
-            MeshiaCascadingAvatarMeshSimplifier simplifier,
-            int raySampleCount = 256)
+        public readonly Dictionary<Renderer, float[]> VertexScores = new();
+
+        public void Dispose()
         {
+            foreach (var mesh in BakedMeshes.Values)
+                if (mesh != null) UnityEngine.Object.DestroyImmediate(mesh);
+            BakedMeshes.Clear();
+            VertexScores.Clear();
+        }
+    }
+
+    internal static class OcclusionBudgetAllocator
+    {
+        /// <summary>Maximum number of vertices sampled per renderer for visibility scoring.</summary>
+        private const int MaxSampleVertsPerMesh = 500;
+
+        /// <summary>Number of Fibonacci-sphere view directions used for per-vertex visibility.</summary>
+        private const int RaySampleCount = 64;
+
+        /// <summary>
+        /// Debug data produced by the last <see cref="ComputeVisibilityScores"/> call.
+        /// Used by <see cref="BudgetDebugGizmoDrawer"/> for the mesh heat-map gizmo.
+        /// Null until the first compute or after a domain reload.
+        /// </summary>
+        public static OcclusionDebugData? LastDebugData;
+
+        /// <summary>
+        /// Computes a visibility score [0,1] for each renderer owned by <paramref name="simplifier"/>.
+        /// Score 1.0 = most visible renderer; 0.0 = most occluded.
+        /// <para>
+        /// Uses <b>per-vertex occlusion sampling</b>: each renderer's skinned mesh is baked into
+        /// world space, then for up to <see cref="MaxSampleVertsPerMesh"/> surface vertices
+        /// <see cref="RaySampleCount"/> Fibonacci-sphere view directions are tested. A vertex is
+        /// considered visible from a direction when no other renderer's AABB blocks the ray from
+        /// that vertex toward the viewer. The per-renderer score is the mean vertex visibility,
+        /// normalised by the most-visible renderer and then blended with 1.0 via aggressiveness.
+        /// </para>
+        /// <para>
+        /// Also populates <see cref="LastDebugData"/> with the full baked meshes and propagated
+        /// per-vertex scores for the Scene View heat-map gizmo.
+        /// </para>
+        /// </summary>
+        public static Dictionary<string, float> ComputeVisibilityScores(
+            MeshiaCascadingAvatarMeshSimplifier simplifier)
+        {
+            // Release memory from the previous run.
+            LastDebugData?.Dispose();
+            var debugData = new OcclusionDebugData();
+
             var result = new Dictionary<string, float>();
             var entries = simplifier.Entries;
 
-            if (entries.Count == 0) return result;
+            if (entries.Count == 0)
+            {
+                LastDebugData = debugData;
+                return result;
+            }
 
-            // Gather renderers and their reference paths
+            // Gather renderers and their reference paths.
             var rendererPaths = new List<(Renderer renderer, string path)>();
             foreach (var entry in entries)
             {
@@ -42,190 +90,183 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 rendererPaths.Add((renderer, entry.RendererObjectReference.referencePath));
             }
 
-            if (rendererPaths.Count == 0) return result;
-
-            // Initialize hit counters for all renderers
-            var hitCounts = new Dictionary<Renderer, int>();
-            foreach (var (renderer, _) in rendererPaths)
-                hitCounts[renderer] = 0;
-
-            // Compute combined avatar bounds
-            var avatarBounds = rendererPaths[0].renderer.bounds;
-            foreach (var (renderer, _) in rendererPaths.Skip(1))
-                avatarBounds.Encapsulate(renderer.bounds);
-
-            float farDistance = avatarBounds.size.magnitude * 2f + 1f;
-            var center = avatarBounds.center;
-
-            // Step 1: Multi-directional sampling using Bounds.IntersectRay
-            // No physics required — works reliably in editor mode.
-            //
-            // For each sample direction, we fire a ray toward the avatar center and find
-            // the "front-most" renderer: among all renderers whose AABB the ray intersects,
-            // the one whose BOUNDS CENTER has the HIGHEST projection along the ray direction
-            // is considered the outermost/visible renderer. Using center-depth rather than
-            // AABB front-face distance avoids the problem where the body mesh's large AABB
-            // (which extends to the nose/head) would always appear closest even when clothing
-            // is visually in front of the torso.
-            var directions = GenerateFibonacciSphere(raySampleCount);
-
-            foreach (var dir in directions)
+            if (rendererPaths.Count == 0)
             {
-                var origin = center + dir * farDistance;
-                var ray = new Ray(origin, -dir);
-
-                float maxCenterDepth = float.MinValue;
-                Renderer? frontRenderer = null;
-
-                foreach (var (renderer, _) in rendererPaths)
-                {
-                    // Only consider renderers whose AABB the ray actually intersects
-                    if (!renderer.bounds.IntersectRay(ray, out float dist) || dist < 0f)
-                        continue;
-
-                    // Among intersected renderers, pick the one whose CENTER is
-                    // furthest along the ray direction (= most "in front" of the avatar
-                    // from the viewer's perspective in direction `dir`).
-                    float centerDepth = Vector3.Dot(renderer.bounds.center, dir);
-                    if (centerDepth > maxCenterDepth)
-                    {
-                        maxCenterDepth = centerDepth;
-                        frontRenderer = renderer;
-                    }
-                }
-
-                if (frontRenderer != null)
-                    hitCounts[frontRenderer]++;
+                LastDebugData = debugData;
+                return result;
             }
 
-            // Step 2: Directional-projection bounds heuristic (complement)
-            // For each renderer A, compute what fraction of its 2D projected surface
-            // (in each principal direction) is covered by other renderers that are
-            // "in front of" A in that direction. No size constraint — even smaller
-            // clothing meshes can occlude a larger body mesh.
-            var boundsScores = new Dictionary<Renderer, float>();
-            var principalDirs = new[]
-            {
-                Vector3.right, Vector3.left,
-                Vector3.up,    Vector3.down,
-                Vector3.forward, Vector3.back,
-            };
+            var allRenderers = rendererPaths.Select(rp => rp.renderer).ToArray();
+            int numRenderers = allRenderers.Length;
+            var directions = GenerateFibonacciSphere(RaySampleCount);
+            int numDirs = directions.Length;
 
-            foreach (var (rendererA, _) in rendererPaths)
+            // Precompute per-(direction, renderer) front-face depth to avoid redundant work
+            // inside the inner vertex loop.
+            // frontDepths[di][ri] = maximum extent of renderer[ri]'s AABB along directions[di],
+            // i.e. the depth of the face closest to a viewer looking from directions[di].
+            var frontDepths = new float[numDirs][];
+            for (int di = 0; di < numDirs; di++)
             {
-                float totalOccludedFraction = 0f;
-                int validDirs = 0;
-
-                foreach (var d in principalDirs)
+                var dir = directions[di];
+                var absDir = new Vector3(Mathf.Abs(dir.x), Mathf.Abs(dir.y), Mathf.Abs(dir.z));
+                frontDepths[di] = new float[numRenderers];
+                for (int ri = 0; ri < numRenderers; ri++)
                 {
-                    float areaA = GetProjectedArea(rendererA.bounds, d);
-                    if (areaA <= 0f) continue;
-
-                    float aDepth = Vector3.Dot(rendererA.bounds.center, d);
-                    float occludedArea = 0f;
-
-                    foreach (var (rendererB, _) in rendererPaths)
-                    {
-                        if (rendererB == rendererA) continue;
-
-                        // Only consider renderers whose center is IN FRONT of A along d
-                        float bDepth = Vector3.Dot(rendererB.bounds.center, d);
-                        if (bDepth <= aDepth) continue;
-
-                        occludedArea += GetProjectedOverlapArea(rendererA.bounds, rendererB.bounds, d);
-                    }
-
-                    totalOccludedFraction += Mathf.Clamp01(occludedArea / areaA);
-                    validDirs++;
+                    var b = allRenderers[ri].bounds;
+                    frontDepths[di][ri] = Vector3.Dot(b.center, dir) + Vector3.Dot(b.extents, absDir);
                 }
-
-                float avgOccluded = validDirs > 0 ? totalOccludedFraction / validDirs : 0f;
-                boundsScores[rendererA] = Mathf.Clamp01(1f - avgOccluded);
             }
 
-            // Step 3: Normalize ray scores and combine with bounds scores
-            int maxHits = hitCounts.Values.DefaultIfEmpty(0).Max();
+            // Per-renderer raw mean visibility (before normalisation).
+            var rawScores = new Dictionary<string, float>();
+
+            for (int aIdx = 0; aIdx < numRenderers; aIdx++)
+            {
+                var (rendererA, path) = rendererPaths[aIdx];
+
+                // Bake to a world-space mesh so we can test actual surface positions.
+                var bakedMesh = BakeRendererWorldSpace(rendererA);
+                if (bakedMesh == null || bakedMesh.vertexCount == 0)
+                {
+                    if (bakedMesh != null) UnityEngine.Object.DestroyImmediate(bakedMesh);
+                    rawScores[path] = 1f;
+                    continue;
+                }
+
+                // Cache the full baked mesh for the heat-map gizmo.
+                debugData.BakedMeshes[rendererA] = bakedMesh;
+
+                var worldVerts = bakedMesh.vertices; // world-space
+                int numVerts = worldVerts.Length;
+
+                // Stride-sample vertices for scoring to bound compute time.
+                int stride = Mathf.Max(1, numVerts / MaxSampleVertsPerMesh);
+                int numSamples = (numVerts + stride - 1) / stride;
+                var sampledScores = new float[numSamples];
+
+                for (int si = 0; si < numSamples; si++)
+                {
+                    var P = worldVerts[si * stride];
+                    int visCount = 0;
+
+                    for (int di = 0; di < numDirs; di++)
+                    {
+                        var dir = directions[di];
+                        // Depth of this vertex along the current view direction.
+                        float vertexDepth = Vector3.Dot(P, dir);
+                        // Ray from the vertex outward toward the viewer in direction `dir`.
+                        var ray = new Ray(P, dir);
+                        bool blocked = false;
+
+                        for (int bi = 0; bi < numRenderers; bi++)
+                        {
+                            if (bi == aIdx) continue;
+                            // Early-out: skip renderers whose AABB front face is entirely
+                            // behind (or level with) the vertex — they cannot occlude it.
+                            if (frontDepths[di][bi] <= vertexDepth) continue;
+                            // The AABB front face is in front of the vertex; check if the
+                            // view ray actually passes through the AABB.
+                            if (allRenderers[bi].bounds.IntersectRay(ray))
+                            {
+                                blocked = true;
+                                break;
+                            }
+                        }
+
+                        if (!blocked) visCount++;
+                    }
+
+                    sampledScores[si] = (float)visCount / numDirs;
+                }
+
+                // Per-renderer score = mean visibility across sampled vertices.
+                float sum = 0f;
+                foreach (var s in sampledScores) sum += s;
+                rawScores[path] = numSamples > 0 ? sum / numSamples : 1f;
+
+                // Propagate sampled scores to every vertex in the full mesh for the heat-map.
+                // Each full-mesh vertex at index i receives the score of the stride-aligned
+                // sample at index i/stride. For meshes where consecutive vertex indices are
+                // spatially close (common in well-authored character meshes) this produces a
+                // smooth per-region colour gradient without additional nearest-neighbour work.
+                var fullVertexScores = new float[numVerts];
+                for (int i = 0; i < numVerts; i++)
+                    fullVertexScores[i] = sampledScores[Mathf.Clamp(Mathf.RoundToInt((float)i / stride), 0, numSamples - 1)];
+
+                debugData.VertexScores[rendererA] = fullVertexScores;
+            }
+
+            // Normalise scores relative to the most-visible renderer, then blend with 1.0
+            // via the aggressiveness slider so that 0 = even distribution, 1 = full differentiation.
+            float maxRaw = rawScores.Values.DefaultIfEmpty(0f).Max();
             float aggressiveness = simplifier.OcclusionAggressiveness;
 
-            foreach (var (renderer, path) in rendererPaths)
+            foreach (var (_, path) in rendererPaths)
             {
-                float rayScore = maxHits > 0 ? Mathf.Clamp01((float)hitCounts[renderer] / maxHits) : 1f;
-                float boundsScore = boundsScores.TryGetValue(renderer, out var bs) ? bs : 1f;
-
-                float combinedScore = RayScoreWeight * rayScore + BoundsScoreWeight * boundsScore;
-                float effectiveScore = Mathf.Lerp(1f, combinedScore, aggressiveness);
+                float raw = rawScores.TryGetValue(path, out var r) ? r : 1f;
+                float normalized = maxRaw > 0f ? raw / maxRaw : 1f;
+                float effectiveScore = Mathf.Lerp(1f, normalized, aggressiveness);
                 result[path] = Mathf.Clamp01(effectiveScore);
             }
 
+            LastDebugData = debugData;
             return result;
         }
 
         /// <summary>
-        /// Returns the area of the bounds face perpendicular to <paramref name="dir"/>
-        /// (one of the 6 axis-aligned unit vectors).
+        /// Bakes <paramref name="renderer"/> to a new <see cref="Mesh"/> whose vertices are in
+        /// world space. For <see cref="SkinnedMeshRenderer"/> this captures the current skinned pose.
+        /// Returns <c>null</c> if no mesh could be obtained. Caller must destroy the returned mesh.
         /// </summary>
-        private static float GetProjectedArea(Bounds b, Vector3 dir)
+        private static Mesh? BakeRendererWorldSpace(Renderer renderer)
         {
-            var absDir = new Vector3(Mathf.Abs(dir.x), Mathf.Abs(dir.y), Mathf.Abs(dir.z));
-            // The two axes perpendicular to dir
-            float w, h;
-            if (absDir.x > 0.5f)      { w = b.size.y; h = b.size.z; }
-            else if (absDir.y > 0.5f) { w = b.size.x; h = b.size.z; }
-            else                       { w = b.size.x; h = b.size.y; }
-            return w * h;
+            Mesh? baked = null;
+
+            if (renderer is SkinnedMeshRenderer smr)
+            {
+                baked = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+                smr.BakeMesh(baked);
+            }
+            else if (renderer is MeshRenderer mr)
+            {
+                var mf = mr.GetComponent<MeshFilter>();
+                if (mf?.sharedMesh == null) return null;
+                baked = UnityEngine.Object.Instantiate(mf.sharedMesh);
+                baked.hideFlags = HideFlags.HideAndDontSave;
+            }
+
+            if (baked == null || baked.vertexCount == 0)
+            {
+                if (baked != null) UnityEngine.Object.DestroyImmediate(baked);
+                return null;
+            }
+
+            // Transform vertices from the renderer's local space to world space.
+            var verts = baked.vertices;
+            var m = renderer.transform.localToWorldMatrix;
+            for (int i = 0; i < verts.Length; i++)
+                verts[i] = m.MultiplyPoint3x4(verts[i]);
+            baked.vertices = verts;
+            baked.RecalculateBounds();
+            return baked;
         }
 
-        /// <summary>
-        /// Returns the 2D projected overlap area of bounds <paramref name="a"/> and
-        /// <paramref name="b"/> projected onto the plane perpendicular to <paramref name="dir"/>.
-        /// </summary>
-        private static float GetProjectedOverlapArea(Bounds a, Bounds b, Vector3 dir)
-        {
-            var absDir = new Vector3(Mathf.Abs(dir.x), Mathf.Abs(dir.y), Mathf.Abs(dir.z));
-
-            float ow, oh;
-            if (absDir.x > 0.5f)
-            {
-                ow = Mathf.Max(0f, Mathf.Min(a.max.y, b.max.y) - Mathf.Max(a.min.y, b.min.y));
-                oh = Mathf.Max(0f, Mathf.Min(a.max.z, b.max.z) - Mathf.Max(a.min.z, b.min.z));
-            }
-            else if (absDir.y > 0.5f)
-            {
-                ow = Mathf.Max(0f, Mathf.Min(a.max.x, b.max.x) - Mathf.Max(a.min.x, b.min.x));
-                oh = Mathf.Max(0f, Mathf.Min(a.max.z, b.max.z) - Mathf.Max(a.min.z, b.min.z));
-            }
-            else
-            {
-                ow = Mathf.Max(0f, Mathf.Min(a.max.x, b.max.x) - Mathf.Max(a.min.x, b.min.x));
-                oh = Mathf.Max(0f, Mathf.Min(a.max.y, b.max.y) - Mathf.Max(a.min.y, b.min.y));
-            }
-
-            return ow * oh;
-        }
-
-        /// <summary>Generates evenly-distributed directions on a sphere using the Fibonacci / golden-angle method.</summary>
+        /// <summary>Generates evenly-distributed unit directions on a sphere using the Fibonacci / golden-angle method.</summary>
         private static Vector3[] GenerateFibonacciSphere(int count)
         {
-            if (count <= 0) return System.Array.Empty<Vector3>();
+            if (count <= 0) return Array.Empty<Vector3>();
             if (count == 1) return new[] { Vector3.up };
 
             var points = new Vector3[count];
-            // Golden angle in radians
             float angleIncrement = Mathf.PI * (3f - Mathf.Sqrt(5f));
-
             for (int i = 0; i < count; i++)
             {
-                float y = 1f - (i / (float)(count - 1)) * 2f; // range [-1, 1]
+                float y = 1f - (i / (float)(count - 1)) * 2f;
                 float radius = Mathf.Sqrt(Mathf.Max(0f, 1f - y * y));
                 float theta = angleIncrement * i;
-
-                points[i] = new Vector3(
-                    Mathf.Cos(theta) * radius,
-                    y,
-                    Mathf.Sin(theta) * radius
-                );
+                points[i] = new Vector3(Mathf.Cos(theta) * radius, y, Mathf.Sin(theta) * radius);
             }
-
             return points;
         }
     }
