@@ -606,6 +606,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 // Show visibility score label when OcclusionBased strategy is active
                 var visibilityScoreLabel = itemRoot.Q<Label>("VisibilityScoreLabel");
                 if (Target.AllocationStrategy == BudgetAllocationStrategy.OcclusionBased
+                    && Target.CachedVisibilityScores != null
                     && Target.CachedVisibilityScores.TryGetValue(entry.RendererObjectReference.referencePath, out var visScore))
                 {
                     if (visibilityScoreLabel == null)
@@ -917,8 +918,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             // Resolve occlusion visibility scores
             bool useOcclusion = target.AllocationStrategy == BudgetAllocationStrategy.OcclusionBased;
-            if (useOcclusion && target.CachedVisibilityScores.Count == 0)
+            if (useOcclusion && (target.CachedVisibilityScores == null || target.CachedVisibilityScores.Count == 0))
             {
+                target.CachedVisibilityScores ??= new Dictionary<string, float>();
                 target.CachedVisibilityScores = OcclusionBudgetAllocator.ComputeVisibilityScores(target);
             }
 
@@ -928,7 +930,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 for (int i = 0; i < entries.Count; i++)
                 {
                     var entry = entries[i];
-                    visibilityScores[i] = target.CachedVisibilityScores.TryGetValue(entry.RendererObjectReference.referencePath, out var s)
+                    visibilityScores[i] = (target.CachedVisibilityScores?.TryGetValue(entry.RendererObjectReference.referencePath, out var s) == true)
                         ? s : 1f;
                 }
             }
