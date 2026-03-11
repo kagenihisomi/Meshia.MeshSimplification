@@ -32,13 +32,22 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
                         if (!targetEnabled) continue;
 
                         var renderer = component.Entries[index].GetTargetRenderer(component)!;
+                        var isActive = context.Observe(renderer.gameObject, g => g.activeInHierarchy);
+                        var costumeGroupStr = component.Entries[index].CostumeGroup;
+                        var optimizeDisabled = context.Observe(component, c =>
+                        {
+                            var cg = c.CostumeGroups.FirstOrDefault(g => g.GroupName == costumeGroupStr);
+                            return cg != null ? cg.OptimizeDisabledGameObjects : false;
+                        });
+                        if (!optimizeDisabled && !isActive) continue;
+
                         groups.Add(RenderGroup.For(renderer).WithData<(MeshiaCascadingAvatarMeshSimplifier, int)>((component, index)));
                     }
                 }
             }
             return groups.ToImmutableList();
         }
-        
+
         protected override (MeshSimplificationTarget, MeshSimplifierOptions, BitArray?) QueryTarget(ComputeContext context, RenderGroup group, Renderer original, Renderer proxy)
         {
             var data = group.GetData<(MeshiaCascadingAvatarMeshSimplifier, int)>();
@@ -53,7 +62,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
             return (target, cascadingTarget.Options, preserveBorderEdgeBoneIndices);
         }
 
-        
+
     }
 }
 
