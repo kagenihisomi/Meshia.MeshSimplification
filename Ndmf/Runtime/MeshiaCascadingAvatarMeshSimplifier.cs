@@ -14,6 +14,15 @@ using Unity.Mathematics;
 
 namespace Meshia.MeshSimplification.Ndmf
 {
+    [Serializable]
+    public class CostumeGroup
+    {
+        public string GroupName = "";
+        public int TargetTriangleCount = 70000;
+        public bool OptimizeGroupEnabled = true;
+        public bool OptimizeDisabledGameObjects = false;
+    }
+
     [AddComponentMenu("Meshia Mesh Simplification/Meshia Cascading Avatar Mesh Simplifier")]
     public class MeshiaCascadingAvatarMeshSimplifier : MonoBehaviour
 #if ENABLE_VRCHAT_BASE
@@ -23,19 +32,49 @@ namespace Meshia.MeshSimplification.Ndmf
         public List<MeshiaCascadingAvatarMeshSimplifierRendererEntry> Entries = new();
         public int TargetTriangleCount = 70000;
         public bool AutoAdjustEnabled = true;
-        
+        public List<CostumeGroup> CostumeGroups = new();
+        public int MinimumTriangleThreshold = 500;
+
         public void RefreshEntries()
         {
             using (ListPool<Renderer>.Get(out var ownedRenderers))
             {
                 GetOwnedRenderers(ownedRenderers);
                 var currentEntries = Entries.Select(t => t.GetTargetRenderer(this));
-                var addedEntries = ownedRenderers.Except(currentEntries).Where(MeshiaCascadingAvatarMeshSimplifierRendererEntry.IsValidTarget).Select(renderer => new MeshiaCascadingAvatarMeshSimplifierRendererEntry(renderer!)).ToArray();
+                var addedEntries = ownedRenderers.Except(currentEntries)
+                    .Where(MeshiaCascadingAvatarMeshSimplifierRendererEntry.IsValidTarget)
+                    .Select(renderer =>
+                    {
+                        var entry = new MeshiaCascadingAvatarMeshSimplifierRendererEntry(renderer!);
+                        entry.CostumeGroup = GetCostumeGroupName(renderer!);
+                        return entry;
+                    }).ToArray();
 
                 Entries.AddRange(addedEntries);
             }
 
-            
+            // Sync CostumeGroups list: add any new groups, preserve existing settings
+            var existingGroupNames = new HashSet<string>(CostumeGroups.Select(g => g.GroupName));
+            foreach (var entry in Entries)
+            {
+                if (!string.IsNullOrEmpty(entry.CostumeGroup) && !existingGroupNames.Contains(entry.CostumeGroup))
+                {
+                    CostumeGroups.Add(new CostumeGroup { GroupName = entry.CostumeGroup, TargetTriangleCount = TargetTriangleCount });
+                    existingGroupNames.Add(entry.CostumeGroup);
+                }
+            }
+        }
+
+        private string GetCostumeGroupName(Renderer renderer)
+        {
+            var myScopeOrigin = transform.parent;
+            if (myScopeOrigin == null) return "";
+            Transform current = renderer.transform;
+            while (current.parent != null && current.parent != myScopeOrigin)
+            {
+                current = current.parent;
+            }
+            return current.parent == myScopeOrigin ? current.gameObject.name : "";
         }
 
         private void GetOwnedRenderers(List<Renderer> ownedRenderers)
@@ -198,6 +237,9 @@ namespace Meshia.MeshSimplification.Ndmf
             (1ul << (int)HumanBodyBones.RightLittleDistal);
         public bool Enabled = true;
         public bool Fixed = false;
+        public string CostumeGroup = "";
+
+        internal void ClearCache() { }
 
         [System.ComponentModel.EditorBrowsable(System.ComponentModel.EditorBrowsableState.Never)]
         [Obsolete("For serialization only", true)]
