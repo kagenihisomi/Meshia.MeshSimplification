@@ -338,6 +338,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var computeOcclusionButton = root.Q<Button>("ComputeOcclusionButton");
             var debugGizmosToggle = root.Q<Toggle>("DebugGizmosToggle");
 
+            // EnumField requires Init() to know its enum type before the binding can populate it.
+            // Without this, the dropdown stays blank and fires ChangeEvents with null values.
+            allocationStrategyField.Init(Target.AllocationStrategy);
+
             void UpdateOcclusionControlsVisibility(BudgetAllocationStrategy strategy)
             {
                 bool isOcclusion = strategy == BudgetAllocationStrategy.OcclusionBased;
@@ -350,6 +354,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             allocationStrategyField.RegisterValueChangedCallback(evt =>
             {
+                // Guard against null values that can occur when the EnumField initializes
+                if (evt.newValue == null) return;
                 var strategy = (BudgetAllocationStrategy)evt.newValue;
                 UpdateOcclusionControlsVisibility(strategy);
                 if (AutoAdjustEnabledProperty.boolValue)

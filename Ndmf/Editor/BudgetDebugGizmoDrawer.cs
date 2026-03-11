@@ -60,7 +60,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 string label = $"{renderer.gameObject.name}\n{targetCount}/{originalCount} ({pct}%)";
 
                 if (useOcclusion
-                    && simplifier.CachedVisibilityScores.TryGetValue(entry.RendererObjectReference.referencePath, out var visScore))
+                    && simplifier.CachedVisibilityScores?.TryGetValue(entry.RendererObjectReference.referencePath, out var visScore) == true)
                 {
                     label += $"\nvis: {visScore:F2}";
                 }
