@@ -1,6 +1,7 @@
 <ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" editor-extension-mode="True">
     <ui:HelpBox name="AttachedToRootWarning" message-type="Warning" text="This component should not be attached to root GameObject." style="display: none;" />
     <ui:VisualElement name="MainElement" style="flex-grow: 1;">
+        <ui:Toggle label="Enable NDMF Preview" name="NdmfPreviewToggle" />
         <ui:GroupBox style="flex-direction: row;">
             <ui:IntegerField label="Target Triangle Count" value="70000" name="TargetTriangleCountField" binding-path="TargetTriangleCount" />
             <ui:DropdownField name="TargetTriangleCountPresetDropdownField" />
@@ -17,6 +18,5 @@
             </ui:GroupBox>
         </ui:GroupBox>
         <ui:ListView selection-type="None" name="EntriesListView" show-bound-collection-size="false" virtualization-method="DynamicHeight" binding-path="Entries" />
-        <ui:Toggle label="Enable NDMF Preview" name="NdmfPreviewToggle" />
     </ui:VisualElement>
 </ui:UXML>

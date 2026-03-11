@@ -18,6 +18,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         [SerializeField] VisualTreeAsset editorVisualTreeAsset = null!;
         [SerializeField] VisualTreeAsset entryEditorVisualTreeAsset = null!;
         private MeshiaCascadingAvatarMeshSimplifier Target => (MeshiaCascadingAvatarMeshSimplifier)target;
+        private bool _isAdjustingQuality;
 
         private SerializedProperty AutoAdjustEnabledProperty => serializedObject.FindProperty(nameof(MeshiaCascadingAvatarMeshSimplifier.AutoAdjustEnabled));
         private SerializedProperty TargetTriangleCountProperty => serializedObject.FindProperty(nameof(MeshiaCascadingAvatarMeshSimplifier.TargetTriangleCount));
@@ -39,7 +40,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         private void RefreshEntries()
         {
-            if(Target.transform.parent == null)
+            if (Target.transform.parent == null)
             {
                 return;
             }
@@ -59,13 +60,59 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         }
 
+        private void RefreshEntriesAndSync(bool clearCaches)
+        {
+            Undo.RecordObject(Target, "Refresh Entries");
+            if (clearCaches)
+            {
+                Target.Entries.ForEach(e => e.ClearCache());
+            }
+
+            Target.RefreshEntries();
+            serializedObject.Update();
+        }
+
+        private void ApplyDeterministicAdjustQuality(int fixedIndex = -1)
+        {
+            if (_isAdjustingQuality) return;
+
+            _isAdjustingQuality = true;
+            try
+            {
+                // Sync any pending serializedObject changes to target before adjustment
+                serializedObject.ApplyModifiedProperties();
+                AdjustQuality(fixedIndex);
+                // AdjustQuality calls serializedObject.Update() at the end
+            }
+            finally
+            {
+                _isAdjustingQuality = false;
+            }
+        }
+
+        private static bool IsRendererActiveAndEnabled(Renderer? renderer)
+        {
+            return renderer != null && renderer.gameObject.activeInHierarchy && renderer.enabled;
+        }
+
+        private CostumeGroup? FindCostumeGroup(string groupName)
+        {
+            return Target.CostumeGroups.FirstOrDefault(group => group.GroupName == groupName);
+        }
+
+        private void RefreshEntriesListView(ListView entriesListView)
+        {
+            serializedObject.Update();
+            entriesListView.RefreshItems();
+        }
+
         public override VisualElement CreateInspectorGUI()
         {
             VisualElement root = new();
             editorVisualTreeAsset.CloneTree(root);
 
             serializedObject.Update();
-            
+
             root.Bind(serializedObject);
             var attachedToRootWarning = root.Q<HelpBox>("AttachedToRootWarning");
             var mainElement = root.Q<VisualElement>("MainElement");
@@ -73,12 +120,217 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var targetTriangleCountPresetDropdownField = root.Q<DropdownField>("TargetTriangleCountPresetDropdownField");
             var adjustButton = root.Q<Button>("AdjustButton");
             var autoAdjustEnabledToggle = root.Q<Toggle>("AutoAdjustEnabledToggle");
+
+            var minimumThresholdField = new IntegerField("Minimum Triangle Threshold");
+            minimumThresholdField.bindingPath = nameof(MeshiaCascadingAvatarMeshSimplifier.MinimumTriangleThreshold);
+            minimumThresholdField.isDelayed = true;
+            minimumThresholdField.RegisterValueChangedCallback(changeEvent =>
+            {
+                if (AutoAdjustEnabledProperty.boolValue)
+                {
+                    ApplyDeterministicAdjustQuality();
+                }
+            });
+            autoAdjustEnabledToggle.parent.Add(minimumThresholdField);
+
             var triangleCountLabel = root.Q<IMGUIContainer>("TriangleCountLabel");
 
             var removeInvalidEntriesButton = root.Q<Button>("RemoveInvalidEntriesButton");
             var resetButton = root.Q<Button>("ResetButton");
+
+            var refreshButton = new Button(() =>
+            {
+                RefreshEntriesAndSync(clearCaches: true);
+            })
+            { text = "Refresh Entries" };
+            removeInvalidEntriesButton.parent.Insert(0, refreshButton);
+
             var entriesListView = root.Q<ListView>("EntriesListView");
             var ndmfPreviewToggle = root.Q<Toggle>("NdmfPreviewToggle");
+
+            // Add costume groups UI
+            var costumeGroupsFoldout = new Foldout { text = "Costume Groups (Per-Costume Target Triangle Counts)", value = true };
+            var costumeGroupsContainer = new IMGUIContainer(() =>
+            {
+                var target = Target;
+                EditorGUILayout.LabelField("Configure triangle count targets per costume:", EditorStyles.helpBox);
+
+                // Calculate groups in one pass to avoid lag
+                var currentByGroup = new Dictionary<string, int>();
+                var maxByGroup = new Dictionary<string, int>();
+                var optimizeDisabledByGroup = new Dictionary<string, bool>();
+                var optimizeEnabledByGroup = new Dictionary<string, bool>();
+                foreach (var cg in target.CostumeGroups)
+                {
+                    currentByGroup[cg.GroupName] = 0; maxByGroup[cg.GroupName] = 0;
+                    optimizeDisabledByGroup[cg.GroupName] = cg.OptimizeDisabledGameObjects;
+                    optimizeEnabledByGroup[cg.GroupName] = cg.OptimizeGroupEnabled;
+                }
+                foreach (var entry in target.Entries)
+                {
+                    if (!entry.IsValid(target)) continue;
+
+                    bool groupOptimizeEnabled = optimizeEnabledByGroup.TryGetValue(entry.CostumeGroup, out var optEnabled) && optEnabled;
+                    var r = entry.GetTargetRenderer(target);
+                    bool isActive = IsRendererActiveAndEnabled(r);
+                    bool optimizeDisabled = optimizeDisabledByGroup.TryGetValue(entry.CostumeGroup, out var optDis) ? optDis : false;
+
+                    if (!optimizeDisabled && !isActive) continue;
+
+                    // For disabled groups, count original triangles; for enabled groups, count simplified
+                    if (groupOptimizeEnabled)
+                    {
+                        if (TryGetSimplifiedTriangleCount(entry, true, out var c))
+                        {
+                            if (currentByGroup.ContainsKey(entry.CostumeGroup)) currentByGroup[entry.CostumeGroup] += c;
+                        }
+                    }
+                    else
+                    {
+                        if (TryGetOriginalTriangleCount(entry, false, out var c))
+                        {
+                            if (currentByGroup.ContainsKey(entry.CostumeGroup)) currentByGroup[entry.CostumeGroup] += c;
+                        }
+                    }
+
+                    if (TryGetOriginalTriangleCount(entry, false, out var m))
+                    {
+                        if (maxByGroup.ContainsKey(entry.CostumeGroup)) maxByGroup[entry.CostumeGroup] += m;
+                    }
+                }
+
+                foreach (var costumeGroup in target.CostumeGroups)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField(costumeGroup.GroupName, GUILayout.Width(130));
+
+                    EditorGUI.BeginChangeCheck();
+                    var newOptimizeEnabled = EditorGUILayout.ToggleLeft("Optimize", costumeGroup.OptimizeGroupEnabled, GUILayout.Width(80));
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(target, "Change Costume Group Optimize State");
+                        costumeGroup.OptimizeGroupEnabled = newOptimizeEnabled;
+                        EditorUtility.SetDirty(target);
+                        serializedObject.Update();
+
+                        if (!newOptimizeEnabled)
+                        {
+                            // When disabling optimization, reset all entries to original triangle counts
+                            for (int i = 0; i < target.Entries.Count; i++)
+                            {
+                                var entry = target.Entries[i];
+                                if (entry.CostumeGroup == costumeGroup.GroupName && TryGetOriginalTriangleCount(entry, false, out var originalCount))
+                                {
+                                    entry.TargetTriangleCount = originalCount;
+                                }
+                            }
+                            serializedObject.Update();
+                        }
+                        else if (AutoAdjustEnabledProperty.boolValue)
+                        {
+                            // When enabling, run adjustment to redistribute budget
+                            ApplyDeterministicAdjustQuality();
+                        }
+
+                        RefreshEntriesListView(entriesListView);
+                    }
+
+                    EditorGUI.BeginChangeCheck();
+                    var optimizeDisabled = EditorGUILayout.ToggleLeft("Apply To Inactive", costumeGroup.OptimizeDisabledGameObjects, GUILayout.Width(130));
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(target, "Change Costume Group Optimize Disabled");
+                        costumeGroup.OptimizeDisabledGameObjects = optimizeDisabled;
+                        EditorUtility.SetDirty(target);
+                        serializedObject.Update();
+                        RefreshEntriesListView(entriesListView);
+                        // Apply To Inactive changes which renderers are included, so always re-adjust
+                        if (costumeGroup.OptimizeGroupEnabled && AutoAdjustEnabledProperty.boolValue)
+                        {
+                            ApplyDeterministicAdjustQuality();
+                            RefreshEntriesListView(entriesListView);
+                        }
+                    }
+
+                    if (GUILayout.Button("Ref", GUILayout.Width(35)))
+                    {
+                        foreach (var entry in target.Entries)
+                        {
+                            if (entry.CostumeGroup == costumeGroup.GroupName)
+                            {
+                                entry.ClearCache();
+                            }
+                        }
+                        RefreshEntriesAndSync(clearCaches: false);
+                        RefreshEntriesListView(entriesListView);
+                        // Entries list might have resized, UIElements sometimes needs a kick for list changes but bindings should eventually sync.
+                    }
+
+                    if (GUILayout.Button("Reset", GUILayout.Width(45)))
+                    {
+                        var entriesProperty = EntriesProperty;
+                        for (int i = 0; i < target.Entries.Count; i++)
+                        {
+                            if (target.Entries[i].CostumeGroup == costumeGroup.GroupName)
+                            {
+                                entriesProperty.GetArrayElementAtIndex(i).FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Enabled)).boolValue = true;
+                                entriesProperty.GetArrayElementAtIndex(i).FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Fixed)).boolValue = false;
+                            }
+                        }
+                        serializedObject.ApplyModifiedProperties();
+                        RefreshEntriesListView(entriesListView);
+                        ApplyDeterministicAdjustQuality();
+                        RefreshEntriesListView(entriesListView);
+                    }
+
+                    EditorGUI.BeginChangeCheck();
+                    var newValue = EditorGUILayout.IntField(costumeGroup.TargetTriangleCount, GUILayout.Width(70));
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RecordObject(target, "Change Costume Group Target");
+                        costumeGroup.TargetTriangleCount = newValue;
+                        if (AutoAdjustEnabledProperty.boolValue)
+                        {
+                            ApplyDeterministicAdjustQuality();
+                            RefreshEntriesListView(entriesListView);
+                        }
+                    }
+
+                    var current = currentByGroup.TryGetValue(costumeGroup.GroupName, out var cc) ? cc : 0;
+                    var max = maxByGroup.TryGetValue(costumeGroup.GroupName, out var mm) ? mm : 0;
+                    EditorGUILayout.LabelField($"({current}/{max})", GUILayout.Width(100));
+
+                    EditorGUILayout.EndHorizontal();
+                }
+
+                EditorGUILayout.Space();
+                if (GUILayout.Button("Set All From Preset"))
+                {
+                    var menu = new GenericMenu();
+                    foreach (var preset in TargetTriangleCountPresetNameToValue)
+                    {
+                        menu.AddItem(new GUIContent(preset.Key), false, () =>
+                        {
+                            Undo.RecordObject(target, "Set All Costume Targets From Preset");
+                            foreach (var costumeGroup in target.CostumeGroups)
+                            {
+                                costumeGroup.TargetTriangleCount = preset.Value;
+                            }
+                            if (AutoAdjustEnabledProperty.boolValue)
+                            {
+                                ApplyDeterministicAdjustQuality();
+                            }
+                        });
+                    }
+                    menu.ShowAsContext();
+                }
+            });
+            costumeGroupsFoldout.Add(costumeGroupsContainer);
+
+            // Insert after the target triangle count field's parent group
+            var targetCountGroup = targetTriangleCountField.parent;
+            var insertIndex = mainElement.IndexOf(targetCountGroup) + 1;
+            mainElement.Insert(insertIndex, costumeGroupsFoldout);
 
             attachedToRootWarning.style.display = Target.transform.parent == null ? DisplayStyle.Flex : DisplayStyle.None;
 
@@ -92,15 +344,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 targetTriangleCountPresetDropdownField.SetValueWithoutNotify(name);
                 if (AutoAdjustEnabledProperty.boolValue)
                 {
-                    AdjustQuality();
-                    serializedObject.ApplyModifiedProperties();
+                    ApplyDeterministicAdjustQuality();
                 }
             });
 
             targetTriangleCountPresetDropdownField.choices = TargetTriangleCountPresetNameToValue.Keys.ToList();
             targetTriangleCountPresetDropdownField.RegisterValueChangedCallback(changeEvent =>
             {
-                if(TargetTriangleCountPresetNameToValue.TryGetValue(changeEvent.newValue, out var value))
+                if (TargetTriangleCountPresetNameToValue.TryGetValue(changeEvent.newValue, out var value))
                 {
                     TargetTriangleCountProperty.intValue = value;
                     serializedObject.ApplyModifiedProperties();
@@ -110,8 +361,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             adjustButton.clicked += () =>
             {
-                AdjustQuality();
-                serializedObject.ApplyModifiedProperties();
+                ApplyDeterministicAdjustQuality();
             };
 
             autoAdjustEnabledToggle.RegisterValueChangedCallback(changeEvent =>
@@ -120,21 +370,56 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                 if (autoAdjustEnabled)
                 {
-                    AdjustQuality();
-                    serializedObject.ApplyModifiedProperties();
+                    ApplyDeterministicAdjustQuality();
                 }
             });
 
 
             triangleCountLabel.onGUIHandler = () =>
             {
-                var current = GetTotalSimplifiedTriangleCount(true);
-                var sum = GetTotalOriginalTriangleCount();
-                var countLabel = $"Current: {current} / {sum}";
-                var labelWidth1 = 7f * countLabel.ToString().Count();
-                var isOverflow = TargetTriangleCountProperty.intValue < current;
-                if (isOverflow) EditorGUILayout.LabelField(countLabel + " - Overflow!", GUIStyleHelper.RedStyle, GUILayout.Width(labelWidth1));
-                else EditorGUILayout.LabelField(countLabel, GUILayout.Width(labelWidth1));
+                var target = Target;
+                // Display total - use optimized single pass loop
+                int totalCurrent = 0;
+                int totalSum = 0;
+
+                var optimizeDisabledByGroup = new Dictionary<string, bool>();
+                var optimizeEnabledByGroup = new Dictionary<string, bool>();
+                foreach (var cg in target.CostumeGroups)
+                {
+                    optimizeDisabledByGroup[cg.GroupName] = cg.OptimizeDisabledGameObjects;
+                    optimizeEnabledByGroup[cg.GroupName] = cg.OptimizeGroupEnabled;
+                }
+
+                foreach (var entry in target.Entries)
+                {
+                    if (entry.IsValid(target))
+                    {
+                        bool groupOptimizeEnabled = optimizeEnabledByGroup.TryGetValue(entry.CostumeGroup, out var optEnabled) && optEnabled;
+                        var r = entry.GetTargetRenderer(target);
+                        bool isActive = IsRendererActiveAndEnabled(r);
+                        bool optimizeDisabled = optimizeDisabledByGroup.TryGetValue(entry.CostumeGroup, out var optDis) ? optDis : false;
+
+                        if (!optimizeDisabled && !isActive) continue;
+
+                        // For disabled groups, count original triangles; for enabled groups, count simplified
+                        if (groupOptimizeEnabled)
+                        {
+                            if (TryGetSimplifiedTriangleCount(entry, true, out var c)) totalCurrent += c;
+                        }
+                        else
+                        {
+                            if (TryGetOriginalTriangleCount(entry, false, out var c)) totalCurrent += c;
+                        }
+
+                        if (TryGetOriginalTriangleCount(entry, false, out var m)) totalSum += m;
+                    }
+                }
+
+                var totalLabel = $"Total Current: {totalCurrent} / {totalSum}";
+
+                var isOverflow = TargetTriangleCountProperty.intValue < totalCurrent;
+                if (isOverflow) EditorGUILayout.LabelField(totalLabel + " - Overflow!", GUIStyleHelper.RedStyle, GUILayout.Width(7f * (totalLabel.Length + 12)));
+                else EditorGUILayout.LabelField(totalLabel, EditorStyles.boldLabel);
             };
             removeInvalidEntriesButton.clicked += () =>
             {
@@ -145,7 +430,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 for (int i = 0; i < entries.Count;)
                 {
                     var entry = entries[i];
-                    if(entry.IsValid(target))
+                    if (entry.IsValid(target))
                     {
                         i++;
                     }
@@ -161,7 +446,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             {
                 var originalTriangleCount = GetTotalOriginalTriangleCount();
 
-                var quality = TargetTriangleCountProperty.intValue / (float)originalTriangleCount;
+                var quality = originalTriangleCount > 0 ? TargetTriangleCountProperty.intValue / (float)originalTriangleCount : 1f;
 
                 var entriesProperty = EntriesProperty;
                 var arraySize = entriesProperty.arraySize;
@@ -171,6 +456,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     entryProperty.FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Enabled)).boolValue = true;
                     entryProperty.FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Fixed)).boolValue = false;
                 }
+
+                serializedObject.ApplyModifiedProperties();
+                serializedObject.Update();
 
                 SetQualityAll(quality);
                 serializedObject.ApplyModifiedProperties();
@@ -189,6 +477,32 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 var preserveBorderEdgesBonesFoldout = itemRoot.Q<Foldout>("PreserveBorderEdgesBonesFoldout");
                 itemRoot.BindProperty(entryProperty);
                 itemRoot.userData = index;
+
+                // Add costume group label if it doesn't exist
+                var costumeGroupLabel = itemRoot.Q<Label>("CostumeGroupLabel");
+                if (costumeGroupLabel == null)
+                {
+                    costumeGroupLabel = new Label();
+                    costumeGroupLabel.name = "CostumeGroupLabel";
+                    costumeGroupLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+                    costumeGroupLabel.style.color = new StyleColor(new Color(0.7f, 0.7f, 1f));
+                    costumeGroupLabel.style.marginTop = 10;
+                    costumeGroupLabel.style.marginBottom = 5;
+                    costumeGroupLabel.style.fontSize = 14;
+                    itemRoot.Insert(0, costumeGroupLabel);
+                }
+
+                var isFirstInGroup = index == 0 || Target.Entries[index - 1].CostumeGroup != entry.CostumeGroup;
+                if (isFirstInGroup)
+                {
+                    costumeGroupLabel.style.display = DisplayStyle.Flex;
+                    costumeGroupLabel.text = $"⬇ {entry.CostumeGroup}";
+                }
+                else
+                {
+                    costumeGroupLabel.style.display = DisplayStyle.None;
+                }
+
                 var targetRenderer = entry.GetTargetRenderer(Target);
                 if (targetRenderer != null)
                 {
@@ -204,9 +518,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     targetPathField.value = entry.RendererObjectReference.referencePath;
                     targetObjectField.style.display = DisplayStyle.None;
                 }
-                
 
-                if(TryGetOriginalTriangleCount(entry, true, out var originalTriangleCount))
+
+                if (TryGetOriginalTriangleCount(entry, true, out var originalTriangleCount))
                 {
                     targetTriangleCountSlider.highValue = originalTriangleCount;
 
@@ -218,7 +532,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 else
                 {
                     targetTriangleCountSlider.visible = false;
-                    
+
                     unknownOriginalTriangleCountField.style.display = DisplayStyle.Flex;
 
 
@@ -235,6 +549,12 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                     humanBodyBoneIndex++;
                 }
+
+                var group = FindCostumeGroup(entry.CostumeGroup);
+                bool groupOptimizeEnabled = group?.OptimizeGroupEnabled ?? true;
+                bool applyToInactive = group?.OptimizeDisabledGameObjects ?? false;
+                bool shouldDisableRow = !groupOptimizeEnabled || (!applyToInactive && targetRenderer != null && !IsRendererActiveAndEnabled(targetRenderer));
+                itemRoot.SetEnabled(!shouldDisableRow);
             };
 
 
@@ -260,8 +580,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                     if (AutoAdjustEnabledProperty.boolValue)
                     {
-                        AdjustQuality();
-                        serializedObject.ApplyModifiedProperties();
+                        ApplyDeterministicAdjustQuality();
                     }
                 });
 
@@ -271,8 +590,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 {
                     if (itemRoot.userData is int itemIndex && AutoAdjustEnabledProperty.boolValue)
                     {
-                        AdjustQuality(itemIndex);
-                        serializedObject.ApplyModifiedProperties();
+                        ApplyDeterministicAdjustQuality(itemIndex);
                     }
                 });
 
@@ -289,7 +607,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     Toggle preserveBorderEdgesBoneToggle = new(bone.ToString());
                     preserveBorderEdgesBoneToggle.RegisterValueChangedCallback(changeEvent =>
                     {
-                        if(itemRoot.userData is int itemIndex)
+                        if (itemRoot.userData is int itemIndex)
                         {
                             var preserveBorderEdgesBonesProperty = EntriesProperty.GetArrayElementAtIndex(itemIndex).FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.PreserveBorderEdgesBones));
                             serializedObject.Update();
@@ -306,7 +624,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                             serializedObject.ApplyModifiedProperties();
                         }
-                        
+
                     });
                     preserveBorderEdgesBonesFoldout.Add(preserveBorderEdgesBoneToggle);
                 }
@@ -351,11 +669,30 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         {
             var totalCount = 0;
             var target = Target;
+            var optimizeDisabledByGroup = new Dictionary<string, bool>();
+            var optimizeEnabledByGroup = new Dictionary<string, bool>();
+            foreach (var cg in target.CostumeGroups) optimizeDisabledByGroup[cg.GroupName] = cg.OptimizeDisabledGameObjects;
+            foreach (var cg in target.CostumeGroups) optimizeEnabledByGroup[cg.GroupName] = cg.OptimizeGroupEnabled;
+
             foreach (var entry in target.Entries)
             {
                 if (entry.IsValid(target))
                 {
-                    totalCount += TryGetSimplifiedTriangleCount(entry, usePreview, out var triangleCount) ? triangleCount : 0;
+                    bool groupOptimizeEnabled = optimizeEnabledByGroup.TryGetValue(entry.CostumeGroup, out var optEnabled) && optEnabled;
+                    bool optimizeDisabled = optimizeDisabledByGroup.TryGetValue(entry.CostumeGroup, out var optDis) ? optDis : false;
+                    var r = entry.GetTargetRenderer(target);
+                    bool isActive = IsRendererActiveAndEnabled(r);
+                    if (!optimizeDisabled && !isActive) continue;
+
+                    // For disabled groups, count original triangles; for enabled groups, count simplified
+                    if (groupOptimizeEnabled)
+                    {
+                        totalCount += TryGetSimplifiedTriangleCount(entry, usePreview, out var triangleCount) ? triangleCount : 0;
+                    }
+                    else
+                    {
+                        totalCount += TryGetOriginalTriangleCount(entry, false, out var triangleCount) ? triangleCount : 0;
+                    }
                 }
             }
             return totalCount;
@@ -365,10 +702,75 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         {
             var totalCount = 0;
             var target = Target;
+            var optimizeDisabledByGroup = new Dictionary<string, bool>();
+            var optimizeEnabledByGroup = new Dictionary<string, bool>();
+            foreach (var cg in target.CostumeGroups) optimizeDisabledByGroup[cg.GroupName] = cg.OptimizeDisabledGameObjects;
+            foreach (var cg in target.CostumeGroups) optimizeEnabledByGroup[cg.GroupName] = cg.OptimizeGroupEnabled;
+
             foreach (var entry in target.Entries)
             {
                 if (entry.IsValid(target))
                 {
+                    bool groupOptimizeEnabled = optimizeEnabledByGroup.TryGetValue(entry.CostumeGroup, out var optEnabled) && optEnabled;
+                    bool optimizeDisabled = optimizeDisabledByGroup.TryGetValue(entry.CostumeGroup, out var optDis) ? optDis : false;
+                    var r = entry.GetTargetRenderer(target);
+                    bool isActive = IsRendererActiveAndEnabled(r);
+                    if (!optimizeDisabled && !isActive) continue;
+
+                    // Always count original triangles for total
+                    totalCount += TryGetOriginalTriangleCount(entry, false, out var triangleCount) ? triangleCount : 0;
+                }
+            }
+            return totalCount;
+        }
+
+        private int GetCostumeSimplifiedTriangleCount(string costumeGroup, bool usePreview)
+        {
+            var totalCount = 0;
+            var target = Target;
+            var cg = target.CostumeGroups.FirstOrDefault(g => g.GroupName == costumeGroup);
+            bool optimizeDisabled = cg != null ? cg.OptimizeDisabledGameObjects : false;
+            bool optimizeEnabled = cg == null || cg.OptimizeGroupEnabled;
+
+            foreach (var entry in target.Entries)
+            {
+                if (entry.IsValid(target) && entry.CostumeGroup == costumeGroup)
+                {
+                    var r = entry.GetTargetRenderer(target);
+                    bool isActive = IsRendererActiveAndEnabled(r);
+                    if (!optimizeDisabled && !isActive) continue;
+
+                    // For disabled groups, count original triangles; for enabled groups, count simplified
+                    if (optimizeEnabled)
+                    {
+                        totalCount += TryGetSimplifiedTriangleCount(entry, usePreview, out var triangleCount) ? triangleCount : 0;
+                    }
+                    else
+                    {
+                        totalCount += TryGetOriginalTriangleCount(entry, false, out var triangleCount) ? triangleCount : 0;
+                    }
+                }
+            }
+            return totalCount;
+        }
+
+        private int GetCostumeOriginalTriangleCount(string costumeGroup)
+        {
+            var totalCount = 0;
+            var target = Target;
+            var cg = target.CostumeGroups.FirstOrDefault(g => g.GroupName == costumeGroup);
+            bool optimizeDisabled = cg != null ? cg.OptimizeDisabledGameObjects : false;
+            bool optimizeEnabled = cg == null || cg.OptimizeGroupEnabled;
+
+            foreach (var entry in target.Entries)
+            {
+                if (entry.IsValid(target) && entry.CostumeGroup == costumeGroup)
+                {
+                    var r = entry.GetTargetRenderer(target);
+                    bool isActive = IsRendererActiveAndEnabled(r);
+                    if (!optimizeDisabled && !isActive) continue;
+
+                    // Always count original triangles for total
                     totalCount += TryGetOriginalTriangleCount(entry, false, out var triangleCount) ? triangleCount : 0;
                 }
             }
@@ -381,7 +783,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             {
                 return TryGetOriginalTriangleCount(entry, preferPreview, out triangleCount);
             }
-            if(entry.GetTargetRenderer(Target) is not { } targetRenderer)
+            if (entry.GetTargetRenderer(Target) is not { } targetRenderer)
             {
                 triangleCount = -1;
                 return false;
@@ -393,7 +795,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
             else
             {
-                
+
                 if (RendererUtility.GetMesh(targetRenderer) is { } mesh)
                 {
                     triangleCount = Math.Min(mesh.GetTriangleCount(), entry.TargetTriangleCount);
@@ -437,69 +839,150 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         private void AdjustQuality(int fixedIndex = -1)
         {
-            serializedObject.ApplyModifiedProperties();
-            var targetTotalCount = TargetTriangleCountProperty.intValue;
-
+            // Don't call ApplyModifiedProperties() here - we want to read the current state
+            // from the target object which was just updated by the caller
             var target = Target;
             var entries = target.Entries;
-            var entriesProperty = EntriesProperty;
 
             Undo.RecordObject(target, "Adjust Quality");
 
-            // 比例配分で差分を分配（目標値に到達するまでループ）
-            for (int iteration = 0; iteration < 5; iteration++)
+            // Group entries by costume
+            var entriesByCostume = new Dictionary<string, List<int>>();
+            for (int i = 0; i < entries.Count; i++)
             {
-                var currentTotal = 0;
-                var adjustableTotal = 0;
-                for (int i = 0; i < entries.Count; i++)
+                var entry = entries[i];
+                if (!entry.IsValid(target)) continue;
+
+                var costumeGroup = entry.CostumeGroup;
+                if (!entriesByCostume.ContainsKey(costumeGroup))
+                {
+                    entriesByCostume[costumeGroup] = new List<int>();
+                }
+                entriesByCostume[costumeGroup].Add(i);
+            }
+
+            // Process each costume group separately
+            foreach (var costumeGroup in target.CostumeGroups)
+            {
+                if (!entriesByCostume.TryGetValue(costumeGroup.GroupName, out var groupIndices))
+                    continue;
+
+                if (!costumeGroup.OptimizeGroupEnabled)
+                {
+                    continue;
+                }
+
+                var targetTotalCount = costumeGroup.TargetTriangleCount;
+                var optimizeDisabled = costumeGroup.OptimizeDisabledGameObjects;
+
+                // Determine effective minimum and original counts for each entry
+                var originalCounts = new int[entries.Count];
+                var minCounts = new int[entries.Count];
+                var isAdjustable = new bool[entries.Count];
+                var finalCounts = new int[entries.Count];
+
+                int fixedTotal = 0;
+                int remainingTarget = targetTotalCount;
+
+                foreach (var i in groupIndices)
                 {
                     var entry = entries[i];
+                    var r = entry.GetTargetRenderer(target);
+                    bool isActive = IsRendererActiveAndEnabled(r);
 
-                    if (!entry.IsValid(target))
+                    if (!optimizeDisabled && !isActive)
                     {
+                        finalCounts[i] = 0;
                         continue;
                     }
-                    var entryProperty = entriesProperty.GetArrayElementAtIndex(i);
 
-                    TryGetSimplifiedTriangleCount(entry, false, out var triangleCount);
+                    TryGetOriginalTriangleCount(entry, false, out var maxTriangleCount);
+                    originalCounts[i] = maxTriangleCount;
+                    minCounts[i] = Mathf.Min(maxTriangleCount, target.MinimumTriangleThreshold);
 
-                    currentTotal += triangleCount;
-
-                    if (entry.Enabled && !entry.Fixed && i != fixedIndex)
+                    if (!entry.Enabled || entry.Fixed || i == fixedIndex)
                     {
-                        adjustableTotal += triangleCount;
+                        isAdjustable[i] = false;
+                        TryGetSimplifiedTriangleCount(entry, false, out var fixedCount);
+                        finalCounts[i] = fixedCount;
+                        fixedTotal += fixedCount;
+                    }
+                    else
+                    {
+                        isAdjustable[i] = true;
+                        finalCounts[i] = -1; // to be calculated
                     }
                 }
-                
-                if (adjustableTotal == 0) { Debug.LogError("Adjustable total is 0"); break; }
-                
-                var adjustableTargetCount = targetTotalCount - (currentTotal - adjustableTotal);
-                if (adjustableTargetCount <= 0) { Debug.LogError("Adjustable target count is 0"); break; }
-                
-                // 比例配分で調整
-                var proportion = (float)adjustableTargetCount / adjustableTotal;
-                for (int i = 0; i < entries.Count; i++)
+
+                remainingTarget -= fixedTotal;
+
+                var activeAdjustableIndices = groupIndices.Where(i => isAdjustable[i]).ToList();
+
+                // Iteratively distribute remaining target
+                bool changed = true;
+                while (changed && activeAdjustableIndices.Count > 0 && remainingTarget > 0)
                 {
-                    if (i == fixedIndex) continue;
+                    changed = false;
+                    long adjustableOriginalTotal = activeAdjustableIndices.Sum(i => (long)originalCounts[i]);
 
-                    var entry = entries[i];
-                    if (!entry.IsValid(target))
+                    if (adjustableOriginalTotal == 0) break;
+
+                    double proportion = (double)remainingTarget / adjustableOriginalTotal;
+
+                    for (int j = activeAdjustableIndices.Count - 1; j >= 0; j--)
                     {
-                        continue;
+                        int index = activeAdjustableIndices[j];
+                        int proposedValue = (int)(originalCounts[index] * proportion);
+
+                        // Check bounds
+                        if (proposedValue <= minCounts[index])
+                        {
+                            finalCounts[index] = minCounts[index];
+                            remainingTarget -= minCounts[index];
+                            activeAdjustableIndices.RemoveAt(j);
+                            changed = true;
+                        }
+                        else if (proposedValue >= originalCounts[index])
+                        {
+                            finalCounts[index] = originalCounts[index];
+                            remainingTarget -= originalCounts[index];
+                            activeAdjustableIndices.RemoveAt(j);
+                            changed = true;
+                        }
                     }
-                    var entryProperty = entriesProperty.GetArrayElementAtIndex(i);
-                    
-                    if (entry.Enabled && !entry.Fixed)
-                    {
+                }
 
-                        TryGetSimplifiedTriangleCount(entry, false, out var currentValue);
-                        TryGetOriginalTriangleCount(entry, false, out var maxTriangleCount);
-                        
-                        var newValue = Mathf.Clamp((int)(currentValue * proportion), 0, maxTriangleCount);
-                        entry.TargetTriangleCount = newValue;
+                // If no more bounds are hit, give everyone exactly their proportional share
+                if (activeAdjustableIndices.Count > 0)
+                {
+                    long adjustableOriginalTotal = activeAdjustableIndices.Sum(i => (long)originalCounts[i]);
+                    if (adjustableOriginalTotal > 0)
+                    {
+                        double proportion = Math.Max(0.0, (double)remainingTarget / adjustableOriginalTotal);
+                        foreach (var index in activeAdjustableIndices)
+                        {
+                            finalCounts[index] = Mathf.Clamp((int)(originalCounts[index] * proportion), minCounts[index], originalCounts[index]);
+                        }
+                    }
+                    else
+                    {
+                        foreach (var index in activeAdjustableIndices)
+                        {
+                            finalCounts[index] = minCounts[index];
+                        }
+                    }
+                }
+
+                // Apply to entries
+                foreach (var i in groupIndices)
+                {
+                    if (isAdjustable[i])
+                    {
+                        entries[i].TargetTriangleCount = finalCounts[i];
                     }
                 }
             }
+
             serializedObject.Update();
         }
 
