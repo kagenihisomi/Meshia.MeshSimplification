@@ -333,7 +333,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             mainElement.Insert(insertIndex, costumeGroupsFoldout);
 
             // Wire up strategy controls from UXML
-            var allocationStrategyField = root.Q<UnityEditor.UIElements.EnumField>("AllocationStrategyField");
+            var allocationStrategyField = root.Q<UnityEngine.UIElements.EnumField>("AllocationStrategyField");
             var occlusionAggressivenessSlider = root.Q<Slider>("OcclusionAggressivenessSlider");
             var computeOcclusionButton = root.Q<Button>("ComputeOcclusionButton");
             var debugGizmosToggle = root.Q<Toggle>("DebugGizmosToggle");

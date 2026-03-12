@@ -3,6 +3,7 @@ using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 using Unity.Profiling;
+
 namespace Meshia.MeshSimplification
 {
     struct MergeFactory
@@ -16,6 +17,9 @@ namespace Meshia.MeshSimplification
         public NativeArray<float3> TriangleNormals;
         public bool PreserveBorderEdges;
         public bool PreserveSurfaceCurvature;
+
+        // NEW: Native array holding occlusion weights (0.0 = completely occluded, 1.0 = fully visible)
+        public NativeArray<float> VertexWeights;
 
         PreservedVertexPredicator PreservedVertexPredicator => new()
         {
@@ -115,7 +119,6 @@ namespace Meshia.MeshSimplification
                     goto ApplyCurvatureError;
                 }
 
-
             ComputeVertexError:
                 vertexError = q.ComputeError(position);
 
@@ -123,6 +126,23 @@ namespace Meshia.MeshSimplification
                 var curvatureError = PreserveSurfaceCurvature ? ComputeCurvatureError(vertices) : 0;
 
                 cost = vertexError + curvatureError;
+
+                // NEW: Apply Localised Occlusion Weighting
+                // If a visibility map was provided, scale the geometric cost of this merge.
+                if (VertexWeights.IsCreated && VertexWeights.Length > 0)
+                {
+                    var weightX = VertexWeights[vertices.x];
+                    var weightY = VertexWeights[vertices.y];
+
+                    // We take the max visibility of the two edge vertices. We don't want to 
+                    // accidentally collapse highly visible geometry just because its neighbor is hidden.
+                    var maxVisibility = math.max(weightX, weightY);
+
+                    // Scale the cost. Highly occluded vertices drop to near 0 cost.
+                    // We clamp to 0.001f so the priority queue doesn't get flooded with literal 0s.
+                    cost *= math.max(maxVisibility, 0.001f);
+                }
+
                 return true;
             }
 
@@ -179,5 +199,3 @@ namespace Meshia.MeshSimplification
         }
     }
 }
-
-
