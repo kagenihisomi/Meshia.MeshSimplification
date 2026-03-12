@@ -332,6 +332,59 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var insertIndex = mainElement.IndexOf(targetCountGroup) + 1;
             mainElement.Insert(insertIndex, costumeGroupsFoldout);
 
+            // Wire up strategy controls from UXML
+            var allocationStrategyField = root.Q<UnityEngine.UIElements.EnumField>("AllocationStrategyField");
+            var occlusionAggressivenessSlider = root.Q<Slider>("OcclusionAggressivenessSlider");
+            var computeOcclusionButton = root.Q<Button>("ComputeOcclusionButton");
+            var debugGizmosToggle = root.Q<Toggle>("DebugGizmosToggle");
+
+            // EnumField requires Init() to know its enum type before the binding can populate it.
+            // Without this, the dropdown stays blank and fires ChangeEvents with null values.
+            allocationStrategyField.Init(Target.AllocationStrategy);
+
+            void UpdateOcclusionControlsVisibility(BudgetAllocationStrategy strategy)
+            {
+                bool isOcclusion = strategy == BudgetAllocationStrategy.OcclusionBased;
+                occlusionAggressivenessSlider.style.display = isOcclusion ? DisplayStyle.Flex : DisplayStyle.None;
+                computeOcclusionButton.style.display = isOcclusion ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+
+            // Set initial visibility
+            UpdateOcclusionControlsVisibility(Target.AllocationStrategy);
+
+            allocationStrategyField.RegisterValueChangedCallback(evt =>
+            {
+                // Guard against null values that can occur when the EnumField initializes
+                if (evt.newValue == null) return;
+                var strategy = (BudgetAllocationStrategy)evt.newValue;
+                UpdateOcclusionControlsVisibility(strategy);
+                if (AutoAdjustEnabledProperty.boolValue)
+                    ApplyDeterministicAdjustQuality();
+            });
+
+            occlusionAggressivenessSlider.RegisterValueChangedCallback(evt =>
+            {
+                if (AutoAdjustEnabledProperty.boolValue)
+                    ApplyDeterministicAdjustQuality();
+            });
+
+            computeOcclusionButton.clicked += () =>
+            {
+                var scores = OcclusionBudgetAllocator.ComputeVisibilityScores(Target);
+                Target.CachedVisibilityScores = scores;
+                if (AutoAdjustEnabledProperty.boolValue)
+                    ApplyDeterministicAdjustQuality();
+                RefreshEntriesListView(entriesListView);
+                SceneView.RepaintAll();
+            };
+
+            debugGizmosToggle.SetValueWithoutNotify(BudgetDebugGizmoDrawer.DebugGizmosEnabled);
+            debugGizmosToggle.RegisterValueChangedCallback(evt =>
+            {
+                BudgetDebugGizmoDrawer.DebugGizmosEnabled = evt.newValue;
+                SceneView.RepaintAll();
+            });
+
             attachedToRootWarning.style.display = Target.transform.parent == null ? DisplayStyle.Flex : DisplayStyle.None;
 
 
@@ -555,6 +608,29 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 bool applyToInactive = group?.OptimizeDisabledGameObjects ?? false;
                 bool shouldDisableRow = !groupOptimizeEnabled || (!applyToInactive && targetRenderer != null && !IsRendererActiveAndEnabled(targetRenderer));
                 itemRoot.SetEnabled(!shouldDisableRow);
+
+                // Show visibility score label when OcclusionBased strategy is active
+                var visibilityScoreLabel = itemRoot.Q<Label>("VisibilityScoreLabel");
+                if (Target.AllocationStrategy == BudgetAllocationStrategy.OcclusionBased
+                    && Target.CachedVisibilityScores != null
+                    && Target.CachedVisibilityScores.TryGetValue(entry.RendererObjectReference.referencePath, out var visScore))
+                {
+                    if (visibilityScoreLabel == null)
+                    {
+                        visibilityScoreLabel = new Label { name = "VisibilityScoreLabel" };
+                        visibilityScoreLabel.style.alignSelf = Align.Center;
+                        visibilityScoreLabel.style.marginLeft = 4;
+                        visibilityScoreLabel.style.minWidth = 55;
+                        itemRoot.Q<VisualElement>("VisualElement")?.Add(visibilityScoreLabel);
+                    }
+                    visibilityScoreLabel.text = $"vis: {visScore:F2}";
+                    visibilityScoreLabel.style.color = Color.Lerp(Color.red, Color.green, visScore);
+                    visibilityScoreLabel.style.display = DisplayStyle.Flex;
+                }
+                else if (visibilityScoreLabel != null)
+                {
+                    visibilityScoreLabel.style.display = DisplayStyle.None;
+                }
             };
 
 
@@ -846,6 +922,25 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             Undo.RecordObject(target, "Adjust Quality");
 
+            // Resolve occlusion visibility scores
+            bool useOcclusion = target.AllocationStrategy == BudgetAllocationStrategy.OcclusionBased;
+            if (useOcclusion && (target.CachedVisibilityScores == null || target.CachedVisibilityScores.Count == 0))
+            {
+                target.CachedVisibilityScores ??= new Dictionary<string, float>();
+                target.CachedVisibilityScores = OcclusionBudgetAllocator.ComputeVisibilityScores(target);
+            }
+
+            var visibilityScores = new Dictionary<int, float>();
+            if (useOcclusion)
+            {
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    visibilityScores[i] = (target.CachedVisibilityScores?.TryGetValue(entry.RendererObjectReference.referencePath, out var s) == true)
+                        ? s : 1f;
+                }
+            }
+
             // Group entries by costume
             var entriesByCostume = new Dictionary<string, List<int>>();
             for (int i = 0; i < entries.Count; i++)
@@ -918,21 +1013,26 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                 var activeAdjustableIndices = groupIndices.Where(i => isAdjustable[i]).ToList();
 
+                // Helper: compute effective weight for an index
+                double GetEntryWeight(int idx) =>
+                    useOcclusion
+                        ? originalCounts[idx] * (double)(visibilityScores.TryGetValue(idx, out var vs) ? vs : 1f)
+                        : originalCounts[idx];
+
                 // Iteratively distribute remaining target
                 bool changed = true;
                 while (changed && activeAdjustableIndices.Count > 0 && remainingTarget > 0)
                 {
                     changed = false;
-                    long adjustableOriginalTotal = activeAdjustableIndices.Sum(i => (long)originalCounts[i]);
+                    double adjustableWeightedTotal = activeAdjustableIndices.Sum(GetEntryWeight);
 
-                    if (adjustableOriginalTotal == 0) break;
-
-                    double proportion = (double)remainingTarget / adjustableOriginalTotal;
+                    if (adjustableWeightedTotal == 0) break;
 
                     for (int j = activeAdjustableIndices.Count - 1; j >= 0; j--)
                     {
                         int index = activeAdjustableIndices[j];
-                        int proposedValue = (int)(originalCounts[index] * proportion);
+                        double entryWeight = GetEntryWeight(index);
+                        int proposedValue = (int)(entryWeight / adjustableWeightedTotal * remainingTarget);
 
                         // Check bounds
                         if (proposedValue <= minCounts[index])
@@ -955,13 +1055,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 // If no more bounds are hit, give everyone exactly their proportional share
                 if (activeAdjustableIndices.Count > 0)
                 {
-                    long adjustableOriginalTotal = activeAdjustableIndices.Sum(i => (long)originalCounts[i]);
-                    if (adjustableOriginalTotal > 0)
+                    double adjustableWeightedTotal = activeAdjustableIndices.Sum(GetEntryWeight);
+                    if (adjustableWeightedTotal > 0)
                     {
-                        double proportion = Math.Max(0.0, (double)remainingTarget / adjustableOriginalTotal);
+                        double proportion = Math.Max(0.0, (double)remainingTarget / adjustableWeightedTotal);
                         foreach (var index in activeAdjustableIndices)
                         {
-                            finalCounts[index] = Mathf.Clamp((int)(originalCounts[index] * proportion), minCounts[index], originalCounts[index]);
+                            double entryWeight = GetEntryWeight(index);
+                            finalCounts[index] = Mathf.Clamp((int)(entryWeight * proportion), minCounts[index], originalCounts[index]);
                         }
                     }
                     else

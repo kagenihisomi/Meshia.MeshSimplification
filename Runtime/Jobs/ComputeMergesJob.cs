@@ -28,6 +28,7 @@ namespace Meshia.MeshSimplification
         public NativeArray<VertexMerge> UnorderedDirtyVertexMerges;
         public bool PreserveBorderEdges;
         public bool PreserveSurfaceCurvature;
+        [ReadOnly] public NativeArray<float> VertexWeights;
         public void Execute(int index)
         {
             var mergeFactory = new MergeFactory
@@ -41,6 +42,7 @@ namespace Meshia.MeshSimplification
                 PreserveSurfaceCurvature = PreserveSurfaceCurvature,
                 PreserveBorderEdgesBoneIndices = PreserveBorderEdgesBoneIndices,
                 VertexBlendIndicesBuffer = VertexBlendIndicesBuffer,
+                VertexWeights = VertexWeights
             };
             var edge = Edges[index];
             VertexMerge merge;
