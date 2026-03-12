@@ -42,8 +42,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var debugData = useOcclusion ? OcclusionBudgetAllocator.LastDebugData : null;
 
             // ── Per-vertex mesh heat-map overlay (occlusion mode only, repaint pass) ──
-            // Drawn as semi-transparent GL triangles coloured by per-vertex visibility score.
-            // Red = occluded (low score), yellow = partial, green = fully visible.
+            // Uses pre-baked flat arrays built once at compute time; no per-frame mesh traversal.
+            // Red = occluded (low score), yellow = partial, green = fully visible (high score).
             if (useOcclusion && debugData != null && Event.current.type == EventType.Repaint)
             {
                 var mat = GetOrCreateHeatmapMaterial();
@@ -57,10 +57,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     {
                         var renderer = entry.GetTargetRenderer(simplifier);
                         if (renderer == null) continue;
-                        if (!debugData.BakedMeshes.TryGetValue(renderer, out var mesh)) continue;
-                        if (!debugData.VertexScores.TryGetValue(renderer, out var scores)) continue;
+                        if (!debugData.DrawArrays.TryGetValue(renderer, out var arrays)) continue;
 
-                        DrawMeshHeatmap(mesh, scores);
+                        DrawCachedArrays(arrays.positions, arrays.colors);
                     }
 
                     GL.PopMatrix();
@@ -75,15 +74,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                 var bounds = renderer.bounds;
                 int originalCount = RendererUtility.GetMesh(renderer)?.GetTriangleCount() ?? 0;
-                int targetCount = entry.TargetTriangleCount;
+                int targetCount   = entry.TargetTriangleCount;
 
                 float ratio = originalCount > 0 ? Mathf.Clamp01((float)targetCount / originalCount) : 1f;
 
-                // Wire box colour matches the simplification ratio heat-map.
                 Handles.color = HeatMapColor(ratio);
                 Handles.DrawWireCube(bounds.center, bounds.size);
 
-                int pct = Mathf.RoundToInt(ratio * 100f);
+                int    pct   = Mathf.RoundToInt(ratio * 100f);
                 string label = $"{renderer.gameObject.name}\n{targetCount}/{originalCount} ({pct}%)";
 
                 if (useOcclusion
@@ -98,40 +96,21 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         }
 
         /// <summary>
-        /// Draws <paramref name="mesh"/> (world-space vertices) as GL_TRIANGLES with each vertex
-        /// coloured by its entry in <paramref name="scores"/>, using the red→yellow→green heat-map.
+        /// Draws pre-baked GL triangle arrays (world-space positions, RGBA colors).
+        /// Arrays were built once at compute time; calling this each repaint is fast —
+        /// it is a tight loop over contiguous managed arrays with no dictionary lookups
+        /// or index-buffer traversal.
         /// </summary>
-        private static void DrawMeshHeatmap(Mesh mesh, float[] scores)
+        private static void DrawCachedArrays(Vector3[] positions, Color[] colors)
         {
-            var vertices = mesh.vertices;
-            if (vertices.Length == 0) return;
+            if (positions.Length == 0) return;
 
             GL.Begin(GL.TRIANGLES);
-
-            for (int subIdx = 0; subIdx < mesh.subMeshCount; subIdx++)
+            for (int i = 0; i < positions.Length; i++)
             {
-                var triangles = mesh.GetTriangles(subIdx);
-                for (int i = 0; i + 2 < triangles.Length; i += 3)
-                {
-                    int v0 = triangles[i];
-                    int v1 = triangles[i + 1];
-                    int v2 = triangles[i + 2];
-
-                    // Guard against malformed index buffers.
-                    if ((uint)v0 >= (uint)vertices.Length
-                     || (uint)v1 >= (uint)vertices.Length
-                     || (uint)v2 >= (uint)vertices.Length) continue;
-
-                    Color c0 = HeatMapColor(v0 < scores.Length ? scores[v0] : 0.5f); c0.a = 0.55f;
-                    Color c1 = HeatMapColor(v1 < scores.Length ? scores[v1] : 0.5f); c1.a = 0.55f;
-                    Color c2 = HeatMapColor(v2 < scores.Length ? scores[v2] : 0.5f); c2.a = 0.55f;
-
-                    GL.Color(c0); GL.Vertex(vertices[v0]);
-                    GL.Color(c1); GL.Vertex(vertices[v1]);
-                    GL.Color(c2); GL.Vertex(vertices[v2]);
-                }
+                GL.Color(colors[i]);
+                GL.Vertex(positions[i]);
             }
-
             GL.End();
         }
 
@@ -140,24 +119,23 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             if (_heatmapMat != null) return _heatmapMat;
 
             var shader = Shader.Find("Hidden/Internal-Colored");
-            if (shader == null) return null; // shader not available in this Unity version
+            if (shader == null) return null;
 
             _heatmapMat = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
             _heatmapMat.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
             _heatmapMat.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
-            _heatmapMat.SetInt("_ZWrite", 0);         // don't occlude scene handles
-            _heatmapMat.SetInt("_Cull", (int)CullMode.Off);  // show both sides
-            _heatmapMat.SetInt("_ZTest", (int)CompareFunction.LessEqual);
+            _heatmapMat.SetInt("_ZWrite",   0);                              // don't write depth
+            _heatmapMat.SetInt("_Cull",     (int)CullMode.Off);             // both sides visible
+            _heatmapMat.SetInt("_ZTest",    (int)CompareFunction.LessEqual);
             return _heatmapMat;
         }
 
         private static Color HeatMapColor(float t)
         {
-            // t=0 → red, t=0.5 → yellow, t=1 → green
             if (t <= 0.5f)
-                return Color.Lerp(Color.red, Color.yellow, t * 2f);
+                return Color.Lerp(Color.red,    Color.yellow, t * 2f);
             else
-                return Color.Lerp(Color.yellow, Color.green, (t - 0.5f) * 2f);
+                return Color.Lerp(Color.yellow, Color.green,  (t - 0.5f) * 2f);
         }
     }
 }
