@@ -65,11 +65,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             _positions = new Vector3[triangleLimit * 3];
             _colors = new Color[triangleLimit * 3];
 
-            int outputTriangle = 0;
-            float strideRatio = triangleLimit < totalTriangles ? (float)totalTriangles / triangleLimit : 1f;
+            // Integer stride: sample every Nth triangle (N = totalTriangles / triangleLimit, rounded up)
+            int stride = totalTriangles > triangleLimit ? (totalTriangles + triangleLimit - 1) / triangleLimit : 1;
 
-            int inputTriangle = 0;
-            int nextInput = 0;
+            int outputTriangle = 0;
+            int globalTriangleIndex = 0;
 
             for (int s = 0; s < subMeshCount && outputTriangle < triangleLimit; s++)
             {
@@ -77,11 +77,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 if (desc.topology != MeshTopology.Triangles) continue;
                 var indices = mesh.GetTriangles(s);
 
-                for (int t = 0; t < indices.Length / 3 && outputTriangle < triangleLimit; t++, inputTriangle++)
+                for (int t = 0; t < indices.Length / 3 && outputTriangle < triangleLimit; t++, globalTriangleIndex++)
                 {
-                    // Stride: skip triangles if we're over budget
-                    if (inputTriangle < nextInput) continue;
-                    nextInput = Mathf.RoundToInt((outputTriangle + 1) * strideRatio);
+                    // Sample only every Nth triangle
+                    if (globalTriangleIndex % stride != 0) continue;
 
                     int i0 = indices[t * 3];
                     int i1 = indices[t * 3 + 1];
@@ -100,7 +99,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 }
             }
 
-            // Trim to actual size
+            // Trim to actual size if fewer triangles were sampled
             if (outputTriangle < triangleLimit)
             {
                 Array.Resize(ref _positions, outputTriangle * 3);

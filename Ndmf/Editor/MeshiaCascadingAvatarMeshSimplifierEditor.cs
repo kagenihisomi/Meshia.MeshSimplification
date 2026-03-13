@@ -1046,18 +1046,17 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var target = Target;
             if (!target.UseOcclusionWeightedSimplification) return;
 
-            // Collect all active renderer bounds on the avatar
+            // The component must be a child of the avatar root
             var avatarRoot = target.transform.parent?.gameObject;
-            if (avatarRoot == null) return;
-
-            var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
-            var allBoundsList = new System.Collections.Generic.List<Bounds>();
-            foreach (var r in allRenderers)
+            if (avatarRoot == null)
             {
-                if (r.gameObject.activeInHierarchy && r.enabled)
-                    allBoundsList.Add(r.bounds);
+                Debug.LogWarning("[Meshia] Cannot preview occlusion weights: component must be a child of the avatar root GameObject.");
+                return;
             }
-            var allBounds = allBoundsList.ToArray();
+
+            // Collect all active, enabled renderers on the avatar
+            var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
+            var activeRenderers = System.Array.FindAll(allRenderers, r => r.gameObject.activeInHierarchy && r.enabled);
 
             // Find the first valid SkinnedMeshRenderer entry to preview
             foreach (var entry in target.Entries)
@@ -1077,13 +1076,12 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                         verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
                     bakedMesh.vertices = verts;
 
-                    // Exclude this renderer's own bounds
-                    var ownBounds = smr.bounds;
+                    // Collect occluder bounds: all active renderers except this one (by reference equality)
                     var occluderList = new System.Collections.Generic.List<Bounds>();
-                    foreach (var b in allBounds)
+                    foreach (var r in activeRenderers)
                     {
-                        if (b.center == ownBounds.center && b.size == ownBounds.size) continue;
-                        occluderList.Add(b);
+                        if (!ReferenceEquals(r, smr))
+                            occluderList.Add(r.bounds);
                     }
 
                     var weights = OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), target.OcclusionWeightStrength);

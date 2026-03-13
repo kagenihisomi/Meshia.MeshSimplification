@@ -59,11 +59,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                         foreach (var meshiaCascadingMeshSimplifier in meshiaCascadingMeshSimplifiers)
                         {
-                            // Collect occluder bounds for occlusion-weighted simplification
-                            Bounds[]? allRendererBounds = null;
+                            // Collect all active renderers for occlusion-weighted simplification
+                            Renderer[]? allActiveRenderers = null;
                             if (meshiaCascadingMeshSimplifier.UseOcclusionWeightedSimplification)
                             {
-                                allRendererBounds = CollectActiveRendererBounds(context.AvatarRootObject);
+                                allActiveRenderers = CollectActiveRenderers(context.AvatarRootObject);
                             }
 
                             foreach (var entry in meshiaCascadingMeshSimplifier.Entries)
@@ -77,11 +77,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                                 float[]? vertexOcclusionWeights = null;
                                 if (meshiaCascadingMeshSimplifier.UseOcclusionWeightedSimplification
-                                    && allRendererBounds != null
+                                    && allActiveRenderers != null
                                     && entry.GetTargetRenderer(meshiaCascadingMeshSimplifier) is SkinnedMeshRenderer skinnedMeshRenderer)
                                 {
                                     vertexOcclusionWeights = ComputeOcclusionWeightsForRenderer(
-                                        skinnedMeshRenderer, allRendererBounds,
+                                        skinnedMeshRenderer, allActiveRenderers,
                                         meshiaCascadingMeshSimplifier.OcclusionWeightStrength);
                                 }
 
@@ -144,28 +144,29 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
 #if ENABLE_MODULAR_AVATAR
         /// <summary>
-        /// Returns the world-space AABBs of all active, enabled renderers on the avatar.
+        /// Returns all active, enabled renderers on the avatar.
         /// </summary>
-        private static Bounds[] CollectActiveRendererBounds(GameObject avatarRoot)
+        private static Renderer[] CollectActiveRenderers(GameObject avatarRoot)
         {
             var renderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
-            using (ListPool<Bounds>.Get(out var boundsList))
+            using (ListPool<Renderer>.Get(out var activeList))
             {
                 foreach (var r in renderers)
                 {
                     if (r.gameObject.activeInHierarchy && r.enabled)
-                        boundsList.Add(r.bounds);
+                        activeList.Add(r);
                 }
-                return boundsList.ToArray();
+                return activeList.ToArray();
             }
         }
 
         /// <summary>
         /// Bakes the skinned mesh renderer to world space and computes per-vertex occlusion weights.
+        /// Excludes the renderer itself from the occluder set using reference equality.
         /// </summary>
         private static float[] ComputeOcclusionWeightsForRenderer(
             SkinnedMeshRenderer skinnedMeshRenderer,
-            Bounds[] allRendererBounds,
+            Renderer[] allActiveRenderers,
             float occlusionWeightStrength)
         {
             var bakedMesh = new Mesh();
@@ -180,15 +181,13 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
                 bakedMesh.vertices = verts;
 
-                // Exclude this renderer's own bounds from occluders
-                var ownBounds = skinnedMeshRenderer.bounds;
+                // Build occluder bounds: all active renderers except the current one (by reference equality)
                 using (ListPool<Bounds>.Get(out var occluderList))
                 {
-                    foreach (var b in allRendererBounds)
+                    foreach (var r in allActiveRenderers)
                     {
-                        // Exclude bounds that exactly match this renderer's bounds
-                        if (b.center == ownBounds.center && b.size == ownBounds.size) continue;
-                        occluderList.Add(b);
+                        if (!ReferenceEquals(r, skinnedMeshRenderer))
+                            occluderList.Add(r.bounds);
                     }
 
                     return OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), occlusionWeightStrength);
