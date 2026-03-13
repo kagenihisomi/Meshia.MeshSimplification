@@ -116,6 +116,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         private static void OnSceneGUI(SceneView sceneView)
         {
+            if (Event.current.type != EventType.Repaint) return;
             var positions = _positions;
             var colors = _colors;
 
@@ -151,6 +152,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             _glMaterial.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
             _glMaterial.SetInt("_Cull", (int)CullMode.Off);
             _glMaterial.SetInt("_ZWrite", 0);
+            _glMaterial.SetInt("_ZTest", (int)CompareFunction.Always);
             return _glMaterial;
         }
     }
