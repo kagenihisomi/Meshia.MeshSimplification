@@ -35,6 +35,21 @@ namespace Meshia.MeshSimplification.Ndmf
         public List<CostumeGroup> CostumeGroups = new();
         public int MinimumTriangleThreshold = 500;
 
+        /// <summary>
+        /// When true, per-vertex occlusion weights are computed at build time and fed into
+        /// the mesh simplifier so that occluded regions of a mesh collapse more aggressively
+        /// than visible regions. This enables localized simplification within a single mesh.
+        /// </summary>
+        public bool UseOcclusionWeightedSimplification = false;
+
+        /// <summary>
+        /// Controls how strongly occlusion affects the per-vertex simplification weight.
+        /// Range [0, 1]. 0 = no effect (uniform simplification), 1 = maximum differentiation
+        /// (occluded vertices collapse as aggressively as the quality setting allows).
+        /// </summary>
+        [Range(0f, 1f)]
+        public float OcclusionWeightStrength = 0.7f;
+
         public void RefreshEntries()
         {
             using (ListPool<Renderer>.Get(out var ownedRenderers))

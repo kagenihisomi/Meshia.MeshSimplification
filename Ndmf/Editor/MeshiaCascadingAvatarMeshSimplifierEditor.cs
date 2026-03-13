@@ -374,6 +374,30 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 }
             });
 
+            // --- Occlusion-Weighted Simplification UI ---
+            var occlusionWeightedToggle = root.Q<Toggle>("OcclusionWeightedToggle");
+            var occlusionWeightStrengthSlider = root.Q<Slider>("OcclusionWeightStrengthSlider");
+            var previewOcclusionWeightsButton = root.Q<Button>("PreviewOcclusionWeightsButton");
+
+            if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null)
+            {
+                // Set initial visibility based on current serialized value
+                bool initialOcclusionEnabled = Target.UseOcclusionWeightedSimplification;
+                occlusionWeightStrengthSlider.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                previewOcclusionWeightsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+
+                occlusionWeightedToggle.RegisterValueChangedCallback(evt =>
+                {
+                    bool enabled = evt.newValue;
+                    occlusionWeightStrengthSlider.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    previewOcclusionWeightsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    if (!enabled)
+                        OcclusionWeightGizmoDrawer.ClearPreviewData();
+                });
+
+                previewOcclusionWeightsButton.clicked += () => ComputeAndPreviewOcclusionWeights();
+            }
+
 
             triangleCountLabel.onGUIHandler = () =>
             {
@@ -1010,6 +1034,68 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                     targetTriangleCountProperty.intValue = (int)(originalTriangleCount * ratio);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Computes per-vertex occlusion weights for all entries and sends the first valid
+        /// SkinnedMeshRenderer's data to <see cref="OcclusionWeightGizmoDrawer"/> for Scene View preview.
+        /// </summary>
+        private void ComputeAndPreviewOcclusionWeights()
+        {
+            var target = Target;
+            if (!target.UseOcclusionWeightedSimplification) return;
+
+            // Collect all active renderer bounds on the avatar
+            var avatarRoot = target.transform.parent?.gameObject;
+            if (avatarRoot == null) return;
+
+            var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
+            var allBoundsList = new System.Collections.Generic.List<Bounds>();
+            foreach (var r in allRenderers)
+            {
+                if (r.gameObject.activeInHierarchy && r.enabled)
+                    allBoundsList.Add(r.bounds);
+            }
+            var allBounds = allBoundsList.ToArray();
+
+            // Find the first valid SkinnedMeshRenderer entry to preview
+            foreach (var entry in target.Entries)
+            {
+                if (!entry.IsValid(target) || !entry.Enabled) continue;
+                if (entry.GetTargetRenderer(target) is not SkinnedMeshRenderer smr) continue;
+
+                var bakedMesh = new Mesh();
+                try
+                {
+                    smr.BakeMesh(bakedMesh);
+
+                    // Transform vertices to world space
+                    var localToWorld = smr.transform.localToWorldMatrix;
+                    var verts = bakedMesh.vertices;
+                    for (int v = 0; v < verts.Length; v++)
+                        verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
+                    bakedMesh.vertices = verts;
+
+                    // Exclude this renderer's own bounds
+                    var ownBounds = smr.bounds;
+                    var occluderList = new System.Collections.Generic.List<Bounds>();
+                    foreach (var b in allBounds)
+                    {
+                        if (b.center == ownBounds.center && b.size == ownBounds.size) continue;
+                        occluderList.Add(b);
+                    }
+
+                    var weights = OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), target.OcclusionWeightStrength);
+                    OcclusionWeightGizmoDrawer.SetPreviewData(bakedMesh, weights);
+                }
+                finally
+                {
+                    UnityEngine.Object.DestroyImmediate(bakedMesh);
+                }
+
+                // Only preview the first entry
+                break;
             }
         }
 

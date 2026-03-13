@@ -44,7 +44,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     var meshiaCascadingMeshSimplifiers = context.AvatarRootObject.GetComponentsInChildren<MeshiaCascadingAvatarMeshSimplifier>(true);
 #endif
 
-                    using (ListPool<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, BitArray? preserveBorderEdgesBoneIndices, Mesh Destination)>.Get(out var parameters))
+                    using (ListPool<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, BitArray? preserveBorderEdgesBoneIndices, float[]? VertexOcclusionWeights, Mesh Destination)>.Get(out var parameters))
                     {
                         foreach (var meshiaMeshSimplifier in meshiaMeshSimplifiers)
                         {
@@ -52,13 +52,20 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                             {
                                 var sourceMesh = RendererUtility.GetRequiredMesh(renderer);
                                 Mesh simplifiedMesh = new();
-                                parameters.Add((sourceMesh, meshiaMeshSimplifier.target, meshiaMeshSimplifier.options, null, simplifiedMesh));
+                                parameters.Add((sourceMesh, meshiaMeshSimplifier.target, meshiaMeshSimplifier.options, null, null, simplifiedMesh));
                             }
                         }
 #if ENABLE_MODULAR_AVATAR
 
                         foreach (var meshiaCascadingMeshSimplifier in meshiaCascadingMeshSimplifiers)
                         {
+                            // Collect occluder bounds for occlusion-weighted simplification
+                            Bounds[]? allRendererBounds = null;
+                            if (meshiaCascadingMeshSimplifier.UseOcclusionWeightedSimplification)
+                            {
+                                allRendererBounds = CollectActiveRendererBounds(context.AvatarRootObject);
+                            }
+
                             foreach (var entry in meshiaCascadingMeshSimplifier.Entries)
                             {
                                 if (!entry.IsValid(meshiaCascadingMeshSimplifier) || !entry.Enabled) continue;
@@ -68,7 +75,17 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                                 var preserveBorderEdgesBoneIndices = MeshiaCascadingAvatarMeshSimplifier.GetPreserveBorderEdgesBoneIndices(context.AvatarRootObject, meshiaCascadingMeshSimplifier, entry);
 
-                                parameters.Add((mesh, target, entry.Options, preserveBorderEdgesBoneIndices, simplifiedMesh));
+                                float[]? vertexOcclusionWeights = null;
+                                if (meshiaCascadingMeshSimplifier.UseOcclusionWeightedSimplification
+                                    && allRendererBounds != null
+                                    && entry.GetTargetRenderer(meshiaCascadingMeshSimplifier) is SkinnedMeshRenderer skinnedMeshRenderer)
+                                {
+                                    vertexOcclusionWeights = ComputeOcclusionWeightsForRenderer(
+                                        skinnedMeshRenderer, allRendererBounds,
+                                        meshiaCascadingMeshSimplifier.OcclusionWeightStrength);
+                                }
+
+                                parameters.Add((mesh, target, entry.Options, preserveBorderEdgesBoneIndices, vertexOcclusionWeights, simplifiedMesh));
                             }
                         }
 
@@ -82,7 +99,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                             {
                                 if(meshiaMeshSimplifier.enabled && meshiaMeshSimplifier.TryGetComponent<Renderer>(out var renderer))
                                 {
-                                    var (mesh, target, options, _, simplifiedMesh) = parameters[i++];
+                                    var (mesh, target, options, _, _, simplifiedMesh) = parameters[i++];
                                     AssetDatabase.AddObjectToAsset(simplifiedMesh, context.AssetContainer);
                                     RendererUtility.SetMesh(renderer, simplifiedMesh);
                                 }
@@ -100,7 +117,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                                 {
                                     if (!cascadingTarget.IsValid(meshiaCascadingMeshSimplifier) || !cascadingTarget.Enabled) continue;
                                     var renderer = cascadingTarget.GetTargetRenderer(meshiaCascadingMeshSimplifier)!;
-                                    var (mesh, target, options, _, simplifiedMesh) = parameters[i++];
+                                    var (mesh, target, options, _, _, simplifiedMesh) = parameters[i++];
                                     AssetDatabase.AddObjectToAsset(simplifiedMesh, context.AssetContainer);
                                     RendererUtility.SetMesh(renderer, simplifiedMesh);
 
@@ -124,5 +141,65 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 })
             ;
         }
+
+#if ENABLE_MODULAR_AVATAR
+        /// <summary>
+        /// Returns the world-space AABBs of all active, enabled renderers on the avatar.
+        /// </summary>
+        private static Bounds[] CollectActiveRendererBounds(GameObject avatarRoot)
+        {
+            var renderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
+            using (ListPool<Bounds>.Get(out var boundsList))
+            {
+                foreach (var r in renderers)
+                {
+                    if (r.gameObject.activeInHierarchy && r.enabled)
+                        boundsList.Add(r.bounds);
+                }
+                return boundsList.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Bakes the skinned mesh renderer to world space and computes per-vertex occlusion weights.
+        /// </summary>
+        private static float[] ComputeOcclusionWeightsForRenderer(
+            SkinnedMeshRenderer skinnedMeshRenderer,
+            Bounds[] allRendererBounds,
+            float occlusionWeightStrength)
+        {
+            var bakedMesh = new Mesh();
+            try
+            {
+                skinnedMeshRenderer.BakeMesh(bakedMesh);
+
+                // Transform vertices from local space to world space
+                var localToWorld = skinnedMeshRenderer.transform.localToWorldMatrix;
+                var verts = bakedMesh.vertices;
+                for (int v = 0; v < verts.Length; v++)
+                    verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
+                bakedMesh.vertices = verts;
+
+                // Exclude this renderer's own bounds from occluders
+                var ownBounds = skinnedMeshRenderer.bounds;
+                using (ListPool<Bounds>.Get(out var occluderList))
+                {
+                    foreach (var b in allRendererBounds)
+                    {
+                        // Exclude bounds that exactly match this renderer's bounds
+                        if (b.center == ownBounds.center && b.size == ownBounds.size) continue;
+                        occluderList.Add(b);
+                    }
+
+                    return OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), occlusionWeightStrength);
+                }
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(bakedMesh);
+            }
+        }
+#endif
     }
 }
+
