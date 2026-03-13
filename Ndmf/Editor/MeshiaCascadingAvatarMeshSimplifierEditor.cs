@@ -46,10 +46,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
             Undo.RecordObject(Target, "Get entries");
             try
-            {
-                Target.RefreshEntries();
+                {
+                    Target.RefreshEntries();
             }
-            catch (InvalidOperationException e)
+                catch (InvalidOperationException e)
             {
                 Debug.LogException(e, target);
                 return;
@@ -1058,12 +1058,15 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
             var activeRenderers = System.Array.FindAll(allRenderers, r => r.gameObject.activeInHierarchy && r.enabled);
 
-            // Find the first valid SkinnedMeshRenderer entry to preview
+            // Start fresh preview data so we can append multiple meshes
+            OcclusionWeightGizmoDrawer.ClearPreviewData();
+
             foreach (var entry in target.Entries)
             {
                 if (!entry.IsValid(target) || !entry.Enabled) continue;
                 if (entry.GetTargetRenderer(target) is not SkinnedMeshRenderer smr) continue;
 
+                Debug.Log($"Processing entry for renderer reference path '{entry.RendererObjectReference.referencePath}'");
                 var bakedMesh = new Mesh();
                 try
                 {
@@ -1085,15 +1088,17 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     }
 
                     var weights = OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), target.OcclusionWeightStrength);
-                    OcclusionWeightGizmoDrawer.SetPreviewData(bakedMesh, weights);
+                    OcclusionWeightGizmoDrawer.AppendPreviewData(bakedMesh, weights);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"Failed to compute occlusion weights for renderer '{smr.name}': {e}");
                 }
                 finally
                 {
-                    UnityEngine.Object.DestroyImmediate(bakedMesh);
+                    Debug.Log("Cleaning up baked mesh.");
+                    // UnityEngine.Object.DestroyImmediate(bakedMesh);
                 }
-
-                // Only preview the first entry
-                break;
             }
         }
 

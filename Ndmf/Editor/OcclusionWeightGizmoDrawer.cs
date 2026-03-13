@@ -16,7 +16,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
     [InitializeOnLoad]
     internal static class OcclusionWeightGizmoDrawer
     {
-        private const int MaxTrianglesPerMesh = 3000;
+        // Editor-pref keys and defaults
+        private const string PrefKeyMaxTrianglesPerMesh = "Meshia.Occlusion.MaxTrianglesPerMesh";
+        private const string PrefKeyMaxTrianglesTotal = "Meshia.Occlusion.MaxTrianglesTotal";
+        private const int PrefDefaultMaxTrianglesPerMesh = 1000; // Cap to maintain editor performance (90k vertices)
+        private const int PrefDefaultMaxTrianglesTotal = 1000; // Cap total triangles across all appended preview meshes
+
+        private static int MaxTrianglesPerMesh => UnityEditor.EditorPrefs.GetInt(PrefKeyMaxTrianglesPerMesh, PrefDefaultMaxTrianglesPerMesh);
+        private static int MaxTrianglesTotal => UnityEditor.EditorPrefs.GetInt(PrefKeyMaxTrianglesTotal, PrefDefaultMaxTrianglesTotal);
 
         // Pre-baked draw data (built once when preview is triggered)
         [NonSerialized] private static Vector3[]? _positions;
@@ -35,7 +42,50 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         /// <param name="simplificationWeights">Per-vertex weights (1.0 = preserve, 10.0 = aggressive).</param>
         internal static void SetPreviewData(Mesh worldSpaceMesh, float[] simplificationWeights)
         {
-            BuildDrawArrays(worldSpaceMesh, simplificationWeights);
+            // Replace existing preview with the provided single mesh
+            ClearPreviewData();
+            AppendPreviewData(worldSpaceMesh, simplificationWeights);
+            SceneView.RepaintAll();
+        }
+
+        /// <summary>
+        /// Appends preview data for an additional mesh. Useful for showing occlusion
+        /// heatmaps across multiple meshes at once.
+        /// </summary>
+        internal static void AppendPreviewData(Mesh worldSpaceMesh, float[] simplificationWeights)
+        {
+            // Build draw arrays for this mesh only
+            BuildDrawArraysForMesh(worldSpaceMesh, simplificationWeights, out var positions, out var colors);
+
+            if (positions == null || positions.Length == 0) return;
+
+            if (_positions == null || _positions.Length == 0)
+            {
+                _positions = positions;
+                _colors = colors;
+            }
+            else
+            {
+                // Concatenate, but respect MaxTrianglesTotal cap
+                int existingTriangles = _positions.Length / 3;
+                int incomingTriangles = positions.Length / 3;
+                int allowedTriangles = Mathf.Max(0, MaxTrianglesTotal - existingTriangles);
+                if (allowedTriangles <= 0) return;
+
+                int trianglesToTake = Mathf.Min(allowedTriangles, incomingTriangles);
+                int vertsToTake = trianglesToTake * 3;
+
+                var newPositions = new Vector3[existingTriangles * 3 + vertsToTake];
+                var newColors = new Color[existingTriangles * 3 + vertsToTake];
+                Array.Copy(_positions, newPositions, _positions.Length);
+                Array.Copy(_colors, newColors, _colors.Length);
+                Array.Copy(positions, 0, newPositions, _positions.Length, vertsToTake);
+                Array.Copy(colors, 0, newColors, _colors.Length, vertsToTake);
+
+                _positions = newPositions;
+                _colors = newColors;
+            }
+
             SceneView.RepaintAll();
         }
 
@@ -47,12 +97,12 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             SceneView.RepaintAll();
         }
 
-        private static void BuildDrawArrays(Mesh mesh, float[] weights)
+        private static void BuildDrawArraysForMesh(Mesh mesh, float[] weights, out Vector3[]? outPositions, out Color[]? outColors)
         {
             var meshVertices = mesh.vertices;
             int subMeshCount = mesh.subMeshCount;
 
-            // Count total triangles across all sub-meshes, capped at MaxTrianglesPerMesh
+            // Count total triangles across all sub-meshes, capped per-mesh
             int totalTriangles = 0;
             for (int s = 0; s < subMeshCount; s++)
             {
@@ -62,8 +112,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
             int triangleLimit = Mathf.Min(totalTriangles, MaxTrianglesPerMesh);
 
-            _positions = new Vector3[triangleLimit * 3];
-            _colors = new Color[triangleLimit * 3];
+            var positions = new Vector3[triangleLimit * 3];
+            var colors = new Color[triangleLimit * 3];
 
             // Integer stride: sample every Nth triangle (N = totalTriangles / triangleLimit, rounded up)
             int stride = totalTriangles > triangleLimit ? (totalTriangles + triangleLimit - 1) / triangleLimit : 1;
@@ -87,13 +137,13 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     int i2 = indices[t * 3 + 2];
 
                     int baseOut = outputTriangle * 3;
-                    _positions[baseOut + 0] = meshVertices[i0];
-                    _positions[baseOut + 1] = meshVertices[i1];
-                    _positions[baseOut + 2] = meshVertices[i2];
+                    positions[baseOut + 0] = meshVertices[i0];
+                    positions[baseOut + 1] = meshVertices[i1];
+                    positions[baseOut + 2] = meshVertices[i2];
 
-                    _colors[baseOut + 0] = WeightToColor(i0 < weights.Length ? weights[i0] : 1f);
-                    _colors[baseOut + 1] = WeightToColor(i1 < weights.Length ? weights[i1] : 1f);
-                    _colors[baseOut + 2] = WeightToColor(i2 < weights.Length ? weights[i2] : 1f);
+                    colors[baseOut + 0] = WeightToColor(i0 < weights.Length ? weights[i0] : 1f);
+                    colors[baseOut + 1] = WeightToColor(i1 < weights.Length ? weights[i1] : 1f);
+                    colors[baseOut + 2] = WeightToColor(i2 < weights.Length ? weights[i2] : 1f);
 
                     outputTriangle++;
                 }
@@ -102,9 +152,12 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             // Trim to actual size if fewer triangles were sampled
             if (outputTriangle < triangleLimit)
             {
-                Array.Resize(ref _positions, outputTriangle * 3);
-                Array.Resize(ref _colors, outputTriangle * 3);
+                Array.Resize(ref positions, outputTriangle * 3);
+                Array.Resize(ref colors, outputTriangle * 3);
             }
+
+            outPositions = positions;
+            outColors = colors;
         }
 
         /// <summary>Maps a simplification weight [1, 10] to a green→red heatmap color.</summary>
