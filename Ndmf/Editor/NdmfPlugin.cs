@@ -40,7 +40,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 {
                     var meshiaMeshSimplifiers = context.AvatarRootObject.GetComponentsInChildren<MeshiaMeshSimplifier>(true);
 #if ENABLE_MODULAR_AVATAR
-                    
+
                     var meshiaCascadingMeshSimplifiers = context.AvatarRootObject.GetComponentsInChildren<MeshiaCascadingAvatarMeshSimplifier>(true);
 #endif
 
@@ -48,7 +48,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     {
                         foreach (var meshiaMeshSimplifier in meshiaMeshSimplifiers)
                         {
-                            if(meshiaMeshSimplifier.enabled && meshiaMeshSimplifier.TryGetComponent<Renderer>(out var renderer))
+                            if (meshiaMeshSimplifier.enabled && meshiaMeshSimplifier.TryGetComponent<Renderer>(out var renderer))
                             {
                                 var sourceMesh = RendererUtility.GetRequiredMesh(renderer);
                                 Mesh simplifiedMesh = new();
@@ -59,33 +59,42 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                         foreach (var meshiaCascadingMeshSimplifier in meshiaCascadingMeshSimplifiers)
                         {
-                            // Collect all active renderers for occlusion-weighted simplification
-                            Renderer[]? allActiveRenderers = null;
+                            // Build one whole-avatar occluder set (static meshes, post-MA) for this
+                            // simplifier.  No BakeMesh is used – the NDMF build operates on
+                            // sharedMesh which is already the final MA-processed geometry.
+                            AvatarOccluderSet? occluderSet = null;
                             if (meshiaCascadingMeshSimplifier.UseOcclusionWeightedSimplification)
                             {
-                                allActiveRenderers = CollectActiveRenderers(context.AvatarRootObject);
+                                occluderSet = AvatarOccluderSet.Build(context.AvatarRootObject);
                             }
 
-                            foreach (var entry in meshiaCascadingMeshSimplifier.Entries)
+                            try
                             {
-                                if (!entry.IsValid(meshiaCascadingMeshSimplifier) || !entry.Enabled) continue;
-                                var mesh = RendererUtility.GetRequiredMesh(entry.GetTargetRenderer(meshiaCascadingMeshSimplifier)!);
-                                var target = new MeshSimplificationTarget() { Kind = MeshSimplificationTargetKind.AbsoluteTriangleCount, Value = entry.TargetTriangleCount };
-                                Mesh simplifiedMesh = new();
-
-                                var preserveBorderEdgesBoneIndices = MeshiaCascadingAvatarMeshSimplifier.GetPreserveBorderEdgesBoneIndices(context.AvatarRootObject, meshiaCascadingMeshSimplifier, entry);
-
-                                float[]? vertexOcclusionWeights = null;
-                                if (meshiaCascadingMeshSimplifier.UseOcclusionWeightedSimplification
-                                    && allActiveRenderers != null
-                                    && entry.GetTargetRenderer(meshiaCascadingMeshSimplifier) is SkinnedMeshRenderer skinnedMeshRenderer)
+                                foreach (var entry in meshiaCascadingMeshSimplifier.Entries)
                                 {
-                                    vertexOcclusionWeights = ComputeOcclusionWeightsForRenderer(
-                                        skinnedMeshRenderer, allActiveRenderers,
-                                        meshiaCascadingMeshSimplifier.OcclusionWeightStrength);
-                                }
+                                    if (!entry.IsValid(meshiaCascadingMeshSimplifier) || !entry.Enabled) continue;
+                                    var mesh = RendererUtility.GetRequiredMesh(entry.GetTargetRenderer(meshiaCascadingMeshSimplifier)!);
+                                    var target = new MeshSimplificationTarget() { Kind = MeshSimplificationTargetKind.AbsoluteTriangleCount, Value = entry.TargetTriangleCount };
+                                    Mesh simplifiedMesh = new();
 
-                                parameters.Add((mesh, target, entry.Options, preserveBorderEdgesBoneIndices, vertexOcclusionWeights, simplifiedMesh));
+                                    var preserveBorderEdgesBoneIndices = MeshiaCascadingAvatarMeshSimplifier.GetPreserveBorderEdgesBoneIndices(context.AvatarRootObject, meshiaCascadingMeshSimplifier, entry);
+
+                                    float[]? vertexOcclusionWeights = null;
+                                    if (occluderSet != null
+                                        && entry.GetTargetRenderer(meshiaCascadingMeshSimplifier) is SkinnedMeshRenderer skinnedMeshRenderer)
+                                    {
+                                        vertexOcclusionWeights = ComputeOcclusionWeightsForRenderer(
+                                            skinnedMeshRenderer,
+                                            occluderSet,
+                                            meshiaCascadingMeshSimplifier.OcclusionWeightStrength);
+                                    }
+
+                                    parameters.Add((mesh, target, entry.Options, preserveBorderEdgesBoneIndices, vertexOcclusionWeights, simplifiedMesh));
+                                }
+                            }
+                            finally
+                            {
+                                occluderSet?.Dispose();
                             }
                         }
 
@@ -97,7 +106,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                             foreach (var meshiaMeshSimplifier in meshiaMeshSimplifiers)
                             {
-                                if(meshiaMeshSimplifier.enabled && meshiaMeshSimplifier.TryGetComponent<Renderer>(out var renderer))
+                                if (meshiaMeshSimplifier.enabled && meshiaMeshSimplifier.TryGetComponent<Renderer>(out var renderer))
                                 {
                                     var (mesh, target, options, _, _, simplifiedMesh) = parameters[i++];
                                     AssetDatabase.AddObjectToAsset(simplifiedMesh, context.AssetContainer);
@@ -144,58 +153,116 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
 #if ENABLE_MODULAR_AVATAR
         /// <summary>
-        /// Returns all active, enabled renderers on the avatar.
+        /// Builds world-space MeshCollider objects for every active renderer in the avatar,
+        /// using each renderer's static <c>sharedMesh</c> (post-MA, no BakeMesh).
+        /// Must be disposed to clean up the temporary GameObjects and Mesh assets.
         /// </summary>
-        private static Renderer[] CollectActiveRenderers(GameObject avatarRoot)
+        private sealed class AvatarOccluderSet : System.IDisposable
         {
-            var renderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
-            using (ListPool<Renderer>.Get(out var activeList))
+            private struct Entry
             {
-                foreach (var r in renderers)
+                public Renderer Renderer;
+                public MeshCollider Collider;
+                public GameObject TempGo;
+                public Mesh TempMesh;
+            }
+
+            private readonly Entry[] _entries;
+            public int Count => _entries.Length;
+
+            private AvatarOccluderSet(Entry[] entries) { _entries = entries; }
+
+            public static AvatarOccluderSet Build(GameObject avatarRoot)
+            {
+                var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
+                using (ListPool<Entry>.Get(out var list))
                 {
-                    if (r.gameObject.activeInHierarchy && r.enabled)
-                        activeList.Add(r);
+                    foreach (var r in allRenderers)
+                    {
+                        if (!r.gameObject.activeInHierarchy || !r.enabled) continue;
+                        var srcMesh = RendererUtility.GetMesh(r);
+                        if (srcMesh == null || srcMesh.vertexCount == 0) continue;
+
+                        // Transform static mesh vertices to world space (no BakeMesh – avoids
+                        // any dependency on bone/blend-shape state at build time).
+                        var worldMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+                        var verts = srcMesh.vertices;
+                        var l2w = r.transform.localToWorldMatrix;
+                        for (int i = 0; i < verts.Length; i++)
+                            verts[i] = l2w.MultiplyPoint3x4(verts[i]);
+                        worldMesh.vertices = verts;
+                        worldMesh.triangles = srcMesh.triangles;
+
+                        var go = new GameObject("MeshiaOccluder") { hideFlags = HideFlags.HideAndDontSave };
+                        var col = go.AddComponent<MeshCollider>();
+                        col.sharedMesh = worldMesh;
+                        list.Add(new Entry { Renderer = r, Collider = col, TempGo = go, TempMesh = worldMesh });
+                    }
+                    return new AvatarOccluderSet(list.ToArray());
                 }
-                return activeList.ToArray();
+            }
+
+            /// <summary>
+            /// Fills <paramref name="buffer"/> with all colliders except the one for
+            /// <paramref name="targetRenderer"/>.  Returns the count via <paramref name="count"/>.
+            /// </summary>
+            public void GetExternalColliders(Renderer targetRenderer, MeshCollider[] buffer, out int count)
+            {
+                count = 0;
+                foreach (var e in _entries)
+                {
+                    if (!ReferenceEquals(e.Renderer, targetRenderer))
+                        buffer[count++] = e.Collider;
+                }
+            }
+
+            public void Dispose()
+            {
+                foreach (var e in _entries)
+                {
+                    if (e.TempGo != null) UnityEngine.Object.DestroyImmediate(e.TempGo);
+                    if (e.TempMesh != null) UnityEngine.Object.DestroyImmediate(e.TempMesh);
+                }
             }
         }
 
         /// <summary>
-        /// Bakes the skinned mesh renderer to world space and computes per-vertex occlusion weights.
-        /// Excludes the renderer itself from the occluder set using reference equality.
+        /// Builds a world-space static mesh from <paramref name="skinnedMeshRenderer"/>'s
+        /// <c>sharedMesh</c> and computes per-vertex occlusion weights using the pre-built
+        /// <paramref name="occluderSet"/>.  No <c>BakeMesh</c> is called – this is intentional
+        /// so the result is deterministic and independent of editor bone/blend-shape state.
         /// </summary>
         private static float[] ComputeOcclusionWeightsForRenderer(
             SkinnedMeshRenderer skinnedMeshRenderer,
-            Renderer[] allActiveRenderers,
+            AvatarOccluderSet occluderSet,
             float occlusionWeightStrength)
         {
-            var bakedMesh = new Mesh();
+            var srcMesh = RendererUtility.GetMesh(skinnedMeshRenderer);
+            if (srcMesh == null || srcMesh.vertexCount == 0)
+                return System.Array.Empty<float>();
+
+            var worldMesh = new Mesh();
             try
             {
-                skinnedMeshRenderer.BakeMesh(bakedMesh);
-
-                // Transform vertices from local space to world space
-                var localToWorld = skinnedMeshRenderer.transform.localToWorldMatrix;
-                var verts = bakedMesh.vertices;
+                var verts = srcMesh.vertices;
+                var normals = srcMesh.normals;
+                var l2w = skinnedMeshRenderer.transform.localToWorldMatrix;
                 for (int v = 0; v < verts.Length; v++)
-                    verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
-                bakedMesh.vertices = verts;
+                    verts[v] = l2w.MultiplyPoint3x4(verts[v]);
+                for (int n = 0; n < normals.Length; n++)
+                    normals[n] = l2w.MultiplyVector(normals[n]).normalized;
 
-                // Build occluder bounds: all active renderers except the current one (by reference equality)
-                using (ListPool<Bounds>.Get(out var occluderList))
-                {
-                    foreach (var r in allActiveRenderers)
-                    {
-                        if (!ReferenceEquals(r, skinnedMeshRenderer))
-                            occluderList.Add(r.bounds);
-                    }
+                worldMesh.vertices = verts;
+                worldMesh.normals = normals;
+                worldMesh.triangles = srcMesh.triangles;
 
-                    return OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), occlusionWeightStrength);
-                }
+                var buffer = new MeshCollider[occluderSet.Count];
+                occluderSet.GetExternalColliders(skinnedMeshRenderer, buffer, out int count);
+                return OcclusionVertexWeighter.ComputeWeights(worldMesh, buffer, count, occlusionWeightStrength);
             }
             finally
             {
-                UnityEngine.Object.DestroyImmediate(bakedMesh);
+                UnityEngine.Object.DestroyImmediate(worldMesh);
             }
         }
 #endif

@@ -64,7 +64,22 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
 
         public static bool TryGetPreviewRenderer(Renderer original, out Renderer previewRenderer)
         {
-            return PreviewRendererCache.TryGetValue(original, out previewRenderer!);
+            previewRenderer = null!;
+            if (original == null)
+                return false;
+
+            if (!PreviewRendererCache.TryGetValue(original, out var cached))
+                return false;
+
+            // Unity destroyed-object semantics: cached may exist in dictionary but be invalid.
+            if (cached == null)
+            {
+                PreviewRendererCache.Remove(original);
+                return false;
+            }
+
+            previewRenderer = cached;
+            return true;
         }
 
         protected abstract (MeshSimplificationTarget, MeshSimplifierOptions, BitArray?) QueryTarget(ComputeContext context, RenderGroup group, Renderer original, Renderer proxy);
