@@ -201,6 +201,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                 foreach (var costumeGroup in target.CostumeGroups)
                 {
+                    string groupPrefix = GetGroupPreviewPrefix(costumeGroup.GroupName);
+                    OcclusionWeightGizmoDrawer.GetPreviewCountsForPrefix(groupPrefix, out int totalOcclusionPreviews, out int enabledOcclusionPreviews);
+                    bool hasOcclusionPreview = totalOcclusionPreviews > 0;
+
                     EditorGUILayout.BeginHorizontal();
                     EditorGUILayout.LabelField(costumeGroup.GroupName, GUILayout.Width(130));
 
@@ -283,6 +287,27 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                         RefreshEntriesListView(entriesListView);
                     }
 
+                    using (new EditorGUI.DisabledScope(!Target.UseOcclusionWeightedSimplification))
+                    {
+                        if (GUILayout.Button("Occl", GUILayout.Width(42)))
+                        {
+                            ComputeAndPreviewOcclusionWeights(costumeGroup.GroupName);
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(!Target.UseOcclusionWeightedSimplification || !hasOcclusionPreview))
+                    {
+                        if (GUILayout.Button(enabledOcclusionPreviews > 0 ? "Hide O" : "Show O", GUILayout.Width(58)))
+                        {
+                            OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix(groupPrefix, enabledOcclusionPreviews == 0);
+                        }
+
+                        if (GUILayout.Button("Clr O", GUILayout.Width(50)))
+                        {
+                            OcclusionWeightGizmoDrawer.RemovePreviewDataForPrefix(groupPrefix);
+                        }
+                    }
+
                     EditorGUI.BeginChangeCheck();
                     var newValue = EditorGUILayout.IntField(costumeGroup.TargetTriangleCount, GUILayout.Width(70));
                     if (EditorGUI.EndChangeCheck())
@@ -298,7 +323,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                     var current = currentByGroup.TryGetValue(costumeGroup.GroupName, out var cc) ? cc : 0;
                     var max = maxByGroup.TryGetValue(costumeGroup.GroupName, out var mm) ? mm : 0;
-                    EditorGUILayout.LabelField($"({current}/{max})", GUILayout.Width(100));
+                    EditorGUILayout.LabelField($"({current}/{max}) O:{enabledOcclusionPreviews}/{totalOcclusionPreviews}", GUILayout.Width(145));
 
                     EditorGUILayout.EndHorizontal();
                 }
@@ -379,17 +404,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var occlusionWeightStrengthSlider = root.Q<Slider>("OcclusionWeightStrengthSlider");
             var openOcclusionPreviewSettingsButton = root.Q<Button>("OpenOcclusionPreviewSettingsButton");
             var previewOcclusionWeightsButton = root.Q<Button>("PreviewOcclusionWeightsButton");
-            var occlusionPreviewControlsContainer = root.Q<IMGUIContainer>("OcclusionPreviewControlsContainer");
 
-            if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null && openOcclusionPreviewSettingsButton != null && occlusionPreviewControlsContainer != null)
+            if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null && openOcclusionPreviewSettingsButton != null)
             {
                 // Set initial visibility based on current serialized value
                 bool initialOcclusionEnabled = Target.UseOcclusionWeightedSimplification;
                 occlusionWeightStrengthSlider.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
                 openOcclusionPreviewSettingsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
                 previewOcclusionWeightsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
-                occlusionPreviewControlsContainer.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
-                occlusionPreviewControlsContainer.onGUIHandler = DrawOcclusionPreviewControls;
 
                 occlusionWeightedToggle.RegisterValueChangedCallback(evt =>
                 {
@@ -397,7 +419,6 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     occlusionWeightStrengthSlider.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     openOcclusionPreviewSettingsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     previewOcclusionWeightsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
-                    occlusionPreviewControlsContainer.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     if (!enabled)
                         OcclusionWeightGizmoDrawer.ClearPreviewData();
                 });
@@ -476,24 +497,33 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             };
             resetButton.clicked += () =>
             {
-                var originalTriangleCount = GetTotalOriginalTriangleCount();
+                var target = Target;
+                Undo.RecordObject(target, "Reset Meshia Cascading Avatar Mesh Simplifier");
 
-                var quality = originalTriangleCount > 0 ? TargetTriangleCountProperty.intValue / (float)originalTriangleCount : 1f;
+                // Clear all serialized lists and reset configuration to defaults
+                target.Entries.Clear();
+                target.CostumeGroups.Clear();
 
-                var entriesProperty = EntriesProperty;
-                var arraySize = entriesProperty.arraySize;
-                for (int i = 0; i < arraySize; i++)
+                target.TargetTriangleCount = 70000;
+                target.AutoAdjustEnabled = true;
+                target.MinimumTriangleThreshold = 500;
+                target.UseOcclusionWeightedSimplification = false;
+                target.OcclusionWeightStrength = 0.7f;
+
+                // Rebuild entries from the current avatar hierarchy
+                try
                 {
-                    var entryProperty = entriesProperty.GetArrayElementAtIndex(i);
-                    entryProperty.FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Enabled)).boolValue = true;
-                    entryProperty.FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Fixed)).boolValue = false;
+                    target.RefreshEntries();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Meshia] Exception while refreshing entries during Reset: {ex}");
                 }
 
-                serializedObject.ApplyModifiedProperties();
+                // Ensure serialized state is updated and mark dirty so changes persist
                 serializedObject.Update();
-
-                SetQualityAll(quality);
                 serializedObject.ApplyModifiedProperties();
+                EditorUtility.SetDirty(target);
             };
             entriesListView.bindItem = (itemElement, index) =>
             {
@@ -1059,6 +1089,29 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
         }
 
+        private static Bounds ComputeCurrentWorldBounds(Renderer renderer, Mesh scratchMesh)
+        {
+            if (renderer is not SkinnedMeshRenderer smr || smr.sharedMesh == null)
+                return renderer.bounds;
+
+            smr.BakeMesh(scratchMesh);
+            var verts = scratchMesh.vertices;
+            if (verts.Length == 0)
+                return renderer.bounds;
+
+            var localToWorld = smr.transform.localToWorldMatrix;
+            Vector3 min = localToWorld.MultiplyPoint3x4(verts[0]);
+            Vector3 max = min;
+            for (int i = 1; i < verts.Length; i++)
+            {
+                Vector3 w = localToWorld.MultiplyPoint3x4(verts[i]);
+                min = Vector3.Min(min, w);
+                max = Vector3.Max(max, w);
+            }
+
+            return new Bounds((min + max) * 0.5f, max - min);
+        }
+
         private static Renderer ResolveRendererForCurrentPreviewState(Renderer renderer)
         {
             if (!MeshiaCascadingAvatarMeshSimplifierPreview.IsEnabled())
@@ -1102,29 +1155,34 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
             var activeRenderers = System.Array.FindAll(allRenderers, r => r.gameObject.activeInHierarchy && r.enabled);
-
-            var resolvedRenderers = new Renderer[activeRenderers.Length];
             var activeBounds = new Bounds[activeRenderers.Length];
-            for (int i = 0; i < activeRenderers.Length; i++)
+            var scratchMesh = new Mesh();
+            try
             {
-                var resolved = ResolveRendererForCurrentPreviewState(activeRenderers[i]);
-                resolvedRenderers[i] = resolved;
-                activeBounds[i] = resolved.bounds;
+                for (int i = 0; i < activeRenderers.Length; i++)
+                {
+                    activeRenderers[i] = ResolveRendererForCurrentPreviewState(activeRenderers[i]);
+                    activeBounds[i] = ComputeCurrentWorldBounds(activeRenderers[i], scratchMesh);
+                }
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(scratchMesh);
             }
 
             context = new OcclusionPreviewContext(
-                resolvedRenderers,
+                activeRenderers,
                 activeBounds,
-                new Bounds[Mathf.Max(0, resolvedRenderers.Length - 1)]);
+                new Bounds[Mathf.Max(0, activeRenderers.Length - 1)]);
             return true;
         }
 
         private bool BuildAndStoreOcclusionPreviewForEntry(MeshiaCascadingAvatarMeshSimplifierRendererEntry entry, in OcclusionPreviewContext context)
         {
-            if (entry.GetTargetRenderer(Target) is not Renderer baseRenderer)
+            if (entry.GetTargetRenderer(Target) is not Renderer sourceRenderer)
                 return false;
 
-            var resolvedRenderer = ResolveRendererForCurrentPreviewState(baseRenderer);
+            var resolvedRenderer = ResolveRendererForCurrentPreviewState(sourceRenderer);
             if (resolvedRenderer is not SkinnedMeshRenderer smr)
                 return false;
 

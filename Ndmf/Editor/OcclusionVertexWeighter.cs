@@ -50,7 +50,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             {
                 float occlusionScore = ComputeVertexOcclusionScore(vertices[i], occluderBounds, clampedOccluderCount);
                 // simplificationWeight: 1.0 = fully visible (unchanged), maxWeight = fully occluded (aggressive)
-                weights[i] = Mathf.Lerp(1f, maxWeight, occlusionScore * occlusionWeightStrength);
+                weights[i] = Mathf.Lerp(1f, maxWeight, occlusionScore);
             }
 
             return weights;
@@ -63,6 +63,13 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         private static float ComputeVertexOcclusionScore(Vector3 vertex, Bounds[] occluderBounds, int occluderCount)
         {
             if (occluderCount == 0) return 0f;
+
+            // If a vertex is physically inside any occluder volume, treat it as fully occluded.
+            for (int i = 0; i < occluderCount; i++)
+            {
+                if (occluderBounds[i].Contains(vertex))
+                    return 1f;
+            }
 
             int blockedDirections = 0;
             // Test 6 cardinal directions: +X, -X, +Y, -Y, +Z, -Z

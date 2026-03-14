@@ -25,6 +25,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         private const int PrefDefaultMaxVerticesPerMesh = 20000;
         private const int PrefDefaultMaxVerticesTotal = 80000;
         private const float MarkerSize = 0.0025f;
+        private const float ContrastGamma = 0.55f;
         private const string DefaultPreviewId = "default";
 
         private static int MaxVerticesPerMesh =>
@@ -240,6 +241,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         private static Color WeightToColor(float weight)
         {
             float t = Mathf.InverseLerp(1f, 10f, weight);
+            t = Mathf.Pow(t, ContrastGamma);
             var palette = EditorPrefs.GetString("Meshia.Occlusion.ColorPalette", "Viridis");
             Color c = palette switch
             {
@@ -371,6 +373,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             for (int x = 0; x < _legendTexture.width; x++)
             {
                 float t = x / (_legendTexture.width - 1f);
+                t = Mathf.Pow(t, ContrastGamma);
                 Color c = palette switch
                 {
                     "BlueRed" => Color.Lerp(Color.blue, Color.red, t),

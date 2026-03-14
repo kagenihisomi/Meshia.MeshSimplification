@@ -61,7 +61,8 @@ namespace Meshia.MeshSimplification.Ndmf
                     .Select(renderer =>
                     {
                         var entry = new MeshiaCascadingAvatarMeshSimplifierRendererEntry(renderer!);
-                        entry.CostumeGroup = GetCostumeGroupName(renderer!);
+                        // Normalize group name to avoid accidental duplicates (trim whitespace)
+                        entry.CostumeGroup = (GetCostumeGroupName(renderer!) ?? string.Empty).Trim();
                         return entry;
                     }).ToArray();
 
@@ -69,7 +70,9 @@ namespace Meshia.MeshSimplification.Ndmf
             }
 
             // Sync CostumeGroups list: add any new groups, preserve existing settings
-            var existingGroupNames = new HashSet<string>(CostumeGroups.Select(g => g.GroupName));
+            // Normalize existing group names and use ordinal comparer to avoid
+            // accidental duplicates caused by casing/whitespace differences.
+            var existingGroupNames = new HashSet<string>(CostumeGroups.Select(g => (g.GroupName ?? string.Empty).Trim()), StringComparer.Ordinal);
             foreach (var entry in Entries)
             {
                 if (!string.IsNullOrEmpty(entry.CostumeGroup) && !existingGroupNames.Contains(entry.CostumeGroup))
@@ -78,6 +81,42 @@ namespace Meshia.MeshSimplification.Ndmf
                     existingGroupNames.Add(entry.CostumeGroup);
                 }
             }
+
+            // Normalize entries' CostumeGroup values so they match the normalized
+            // keys used above. This helps avoid creating new groups when a renderer
+            // toggles active/inactive state and its group string contains stray
+            // whitespace or casing differences.
+            for (int i = 0; i < Entries.Count; i++)
+            {
+                Entries[i].CostumeGroup = (Entries[i].CostumeGroup ?? string.Empty).Trim();
+            }
+
+            // Deduplicate CostumeGroups while preserving first-seen order. Merge
+            // non-default settings from later duplicates into the first occurrence.
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var deduped = new List<CostumeGroup>();
+            foreach (var cg in CostumeGroups)
+            {
+                var key = (cg.GroupName ?? string.Empty).Trim();
+                if (!seen.Contains(key))
+                {
+                    seen.Add(key);
+                    cg.GroupName = key;
+                    deduped.Add(cg);
+                }
+                else
+                {
+                    var existing = deduped.First(d => string.Equals(d.GroupName, key, StringComparison.Ordinal));
+                    existing.OptimizeGroupEnabled = existing.OptimizeGroupEnabled || cg.OptimizeGroupEnabled;
+                    existing.OptimizeDisabledGameObjects = existing.OptimizeDisabledGameObjects || cg.OptimizeDisabledGameObjects;
+                    if (existing.TargetTriangleCount == TargetTriangleCount && cg.TargetTriangleCount != TargetTriangleCount)
+                    {
+                        existing.TargetTriangleCount = cg.TargetTriangleCount;
+                    }
+                }
+            }
+            CostumeGroups.Clear();
+            CostumeGroups.AddRange(deduped);
         }
 
         private string GetCostumeGroupName(Renderer renderer)
@@ -89,14 +128,22 @@ namespace Meshia.MeshSimplification.Ndmf
             {
                 current = current.parent;
             }
-            return current.parent == myScopeOrigin ? current.gameObject.name : "";
+            if (current.parent != myScopeOrigin) return "";
+            // When the renderer itself is a direct child of the avatar root (no
+            // costume-container object between it and the root), group it with
+            // all other such renderers under the avatar root name so that base
+            // avatar body parts share a single group rather than each appearing
+            // in its own isolated group.
+            if (current == renderer.transform)
+                return myScopeOrigin.gameObject.name;
+            return current.gameObject.name;
         }
 
         private void GetOwnedRenderers(List<Renderer> ownedRenderers)
         {
             var myScopeOrigin = transform.parent;
 
-            if(myScopeOrigin == null)
+            if (myScopeOrigin == null)
             {
                 throw new InvalidOperationException($"{nameof(MeshiaCascadingAvatarMeshSimplifier)} should not be attached to root GameObject.");
             }
@@ -109,7 +156,7 @@ namespace Meshia.MeshSimplification.Ndmf
                     if (childSimplifier != this)
                     {
                         var otherScopeOrigin = childSimplifier.transform.parent;
-                        if(otherScopeOrigin == myScopeOrigin)
+                        if (otherScopeOrigin == myScopeOrigin)
                         {
                             throw new InvalidOperationException($"Multiple {nameof(MeshiaCascadingAvatarMeshSimplifier)} is attached to direct children of GameObject. This is not allowed.");
                         }
@@ -120,7 +167,10 @@ namespace Meshia.MeshSimplification.Ndmf
 
                 using (ListPool<Renderer>.Get(out var childRenderers))
                 {
-                    myScopeOrigin.gameObject.GetComponentsInChildren(childRenderers);
+                    // Include inactive children so disabled renderers are tracked
+                    // and their costume groups are visible in the inspector.
+                    // Populate the list with all renderers (including inactive)
+                    childRenderers.AddRange(myScopeOrigin.gameObject.GetComponentsInChildren<Renderer>(true));
                     for (int i = 0; i < childRenderers.Count;)
                     {
                         Renderer? childRenderer = childRenderers[i];
@@ -172,7 +222,7 @@ namespace Meshia.MeshSimplification.Ndmf
                 }
             }
 
-            
+
         }
 
         public void ResolveReferences()
