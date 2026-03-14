@@ -17,6 +17,13 @@
                 <ui:Button text="Reset" parse-escape-sequences="true" display-tooltip-when-elided="true" name="ResetButton" />
             </ui:GroupBox>
         </ui:GroupBox>
+        <ui:GroupBox label="Occlusion-Weighted Simplification" name="OcclusionGroup">
+            <ui:Toggle label="Enable Occlusion-Weighted Simplification" binding-path="UseOcclusionWeightedSimplification" name="OcclusionWeightedToggle" />
+            <ui:Slider label="Weight Strength" low-value="0" high-value="1" binding-path="OcclusionWeightStrength" name="OcclusionWeightStrengthSlider" style="display: none;" />
+            <ui:Button text="Open Occlusion Preview Settings" name="OpenOcclusionPreviewSettingsButton" style="display: none;" />
+            <ui:Button text="Preview Occlusion Weights" name="PreviewOcclusionWeightsButton" style="display: none;" />
+        </ui:GroupBox>
         <ui:ListView selection-type="None" name="EntriesListView" show-bound-collection-size="false" virtualization-method="DynamicHeight" binding-path="Entries" />
     </ui:VisualElement>
 </ui:UXML>
+
