@@ -15,6 +15,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
         where TDerived : MeshiaMeshSimplifierPreviewBase<TDerived>
     {
         public static readonly Dictionary<Renderer, (int proxy, int simplified)> TriangleCountCache = new();
+        public static readonly Dictionary<Renderer, Renderer> PreviewRendererCache = new();
 
         public static TogglablePreviewNode PreviewControlNode { get; } = TogglablePreviewNode.Create(
                 () => typeof(TDerived).Name,
@@ -40,6 +41,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
             var proxy = proxyPairs.First().Item2;
             var proxyMesh = RendererUtility.GetRequiredMesh(proxy);
 
+            // Keep original -> live preview proxy mapping for editor tooling (e.g., occlusion previews).
+            PreviewRendererCache[original] = proxy;
+
             var (target, options, preserveBorderEdgesBoneIndices) = QueryTarget(context, group, original, proxy);
 
             Mesh simplifiedMesh = new();
@@ -54,8 +58,13 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
             }
 
             TriangleCountCache[original] = (proxyMesh.GetTriangleCount(), simplifiedMesh.GetTriangleCount());
-         
+
             return new NdmfMeshSimplifierPreviewNode(simplifiedMesh);
+        }
+
+        public static bool TryGetPreviewRenderer(Renderer original, out Renderer previewRenderer)
+        {
+            return PreviewRendererCache.TryGetValue(original, out previewRenderer!);
         }
 
         protected abstract (MeshSimplificationTarget, MeshSimplifierOptions, BitArray?) QueryTarget(ComputeContext context, RenderGroup group, Renderer original, Renderer proxy);

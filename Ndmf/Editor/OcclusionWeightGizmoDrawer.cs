@@ -2,6 +2,7 @@
 #if ENABLE_MODULAR_AVATAR
 
 using System;
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -9,25 +10,47 @@ using UnityEngine.Rendering;
 namespace Meshia.MeshSimplification.Ndmf.Editor
 {
     /// <summary>
-    /// Draws a per-vertex occlusion weight heatmap in the Scene View.
+    /// Draws a sampled per-vertex occlusion weight heatmap in the Scene View.
     /// Green = weight 1.0 (visible, preserved), Red = weight 10.0 (occluded, simplified aggressively).
-    /// Uses pre-baked GL draw arrays for responsiveness; no per-frame mesh traversal.
+    /// Uses pre-baked sampled arrays for responsiveness; no per-frame mesh traversal.
     /// </summary>
     [InitializeOnLoad]
     internal static class OcclusionWeightGizmoDrawer
     {
         // Editor-pref keys and defaults
-        private const string PrefKeyMaxTrianglesPerMesh = "Meshia.Occlusion.MaxTrianglesPerMesh";
-        private const string PrefKeyMaxTrianglesTotal = "Meshia.Occlusion.MaxTrianglesTotal";
-        private const int PrefDefaultMaxTrianglesPerMesh = 1000; // Cap to maintain editor performance (90k vertices)
-        private const int PrefDefaultMaxTrianglesTotal = 1000; // Cap total triangles across all appended preview meshes
+        private const string PrefKeyMaxVerticesPerMesh = "Meshia.Occlusion.MaxVerticesPerMesh";
+        private const string PrefKeyMaxVerticesTotal = "Meshia.Occlusion.MaxVerticesTotal";
+        private const string LegacyPrefKeyMaxTrianglesPerMesh = "Meshia.Occlusion.MaxTrianglesPerMesh";
+        private const string LegacyPrefKeyMaxTrianglesTotal = "Meshia.Occlusion.MaxTrianglesTotal";
+        private const int PrefDefaultMaxVerticesPerMesh = 20000;
+        private const int PrefDefaultMaxVerticesTotal = 80000;
+        private const float MarkerSize = 0.0025f;
+        private const string DefaultPreviewId = "default";
 
-        private static int MaxTrianglesPerMesh => UnityEditor.EditorPrefs.GetInt(PrefKeyMaxTrianglesPerMesh, PrefDefaultMaxTrianglesPerMesh);
-        private static int MaxTrianglesTotal => UnityEditor.EditorPrefs.GetInt(PrefKeyMaxTrianglesTotal, PrefDefaultMaxTrianglesTotal);
+        private static int MaxVerticesPerMesh =>
+            GetIntWithLegacyFallback(PrefKeyMaxVerticesPerMesh, LegacyPrefKeyMaxTrianglesPerMesh, PrefDefaultMaxVerticesPerMesh);
 
-        // Pre-baked draw data (built once when preview is triggered)
-        [NonSerialized] private static Vector3[]? _positions;
-        [NonSerialized] private static Color[]? _colors;
+        private static int MaxVerticesTotal =>
+            GetIntWithLegacyFallback(PrefKeyMaxVerticesTotal, LegacyPrefKeyMaxTrianglesTotal, PrefDefaultMaxVerticesTotal);
+
+        private sealed class PreviewBatch
+        {
+            public Vector3[] Positions;
+            public Color[] Colors;
+            public bool Enabled;
+
+            public PreviewBatch(Vector3[] positions, Color[] colors, bool enabled)
+            {
+                Positions = positions;
+                Colors = colors;
+                Enabled = enabled;
+            }
+        }
+
+        [NonSerialized] private static readonly Dictionary<string, PreviewBatch> _previewBatches = new();
+        [NonSerialized] private static Texture2D? _legendTexture;
+        [NonSerialized] private static string? _legendPaletteKey;
+        [NonSerialized] private static int _legacyAppendCounter;
 
         static OcclusionWeightGizmoDrawer()
         {
@@ -42,9 +65,21 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         /// <param name="simplificationWeights">Per-vertex weights (1.0 = preserve, 10.0 = aggressive).</param>
         internal static void SetPreviewData(Mesh worldSpaceMesh, float[] simplificationWeights)
         {
-            // Replace existing preview with the provided single mesh
-            ClearPreviewData();
-            AppendPreviewData(worldSpaceMesh, simplificationWeights);
+            SetPreviewData(DefaultPreviewId, worldSpaceMesh, simplificationWeights, true);
+        }
+
+        internal static void SetPreviewData(string previewId, Mesh worldSpaceMesh, float[] simplificationWeights, bool enabled)
+        {
+            BuildDrawArraysForMesh(worldSpaceMesh, simplificationWeights, out var positions, out var colors);
+
+            if (positions == null || colors == null || positions.Length == 0)
+            {
+                _previewBatches.Remove(previewId);
+                SceneView.RepaintAll();
+                return;
+            }
+
+            _previewBatches[previewId] = new PreviewBatch(positions, colors, enabled);
             SceneView.RepaintAll();
         }
 
@@ -54,106 +89,147 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         /// </summary>
         internal static void AppendPreviewData(Mesh worldSpaceMesh, float[] simplificationWeights)
         {
-            // Build draw arrays for this mesh only
-            BuildDrawArraysForMesh(worldSpaceMesh, simplificationWeights, out var positions, out var colors);
-
-            if (positions == null || positions.Length == 0) return;
-
-            if (_positions == null || _positions.Length == 0)
-            {
-                _positions = positions;
-                _colors = colors;
-            }
-            else
-            {
-                // Concatenate, but respect MaxTrianglesTotal cap
-                int existingTriangles = _positions.Length / 3;
-                int incomingTriangles = positions.Length / 3;
-                int allowedTriangles = Mathf.Max(0, MaxTrianglesTotal - existingTriangles);
-                if (allowedTriangles <= 0) return;
-
-                int trianglesToTake = Mathf.Min(allowedTriangles, incomingTriangles);
-                int vertsToTake = trianglesToTake * 3;
-
-                var newPositions = new Vector3[existingTriangles * 3 + vertsToTake];
-                var newColors = new Color[existingTriangles * 3 + vertsToTake];
-                Array.Copy(_positions, newPositions, _positions.Length);
-                Array.Copy(_colors, newColors, _colors.Length);
-                Array.Copy(positions, 0, newPositions, _positions.Length, vertsToTake);
-                Array.Copy(colors, 0, newColors, _colors.Length, vertsToTake);
-
-                _positions = newPositions;
-                _colors = newColors;
-            }
-
-            SceneView.RepaintAll();
+            SetPreviewData($"legacy-{_legacyAppendCounter++}", worldSpaceMesh, simplificationWeights, true);
         }
 
         /// <summary>Clears the preview and stops drawing.</summary>
         internal static void ClearPreviewData()
         {
-            _positions = null;
-            _colors = null;
+            _previewBatches.Clear();
+            _legacyAppendCounter = 0;
             SceneView.RepaintAll();
+        }
+
+        internal static void RemovePreviewData(string previewId)
+        {
+            if (_previewBatches.Remove(previewId))
+                SceneView.RepaintAll();
+        }
+
+        internal static void RemovePreviewDataForPrefix(string previewPrefix)
+        {
+            bool changed = false;
+            var keysToRemove = new List<string>();
+            foreach (var pair in _previewBatches)
+            {
+                if (pair.Key.StartsWith(previewPrefix, StringComparison.Ordinal))
+                    keysToRemove.Add(pair.Key);
+            }
+
+            foreach (var key in keysToRemove)
+            {
+                changed |= _previewBatches.Remove(key);
+            }
+
+            if (changed)
+                SceneView.RepaintAll();
+        }
+
+        internal static bool HasPreviewData(string previewId)
+        {
+            return _previewBatches.TryGetValue(previewId, out var batch) && batch.Positions.Length > 0;
+        }
+
+        internal static bool HasPreviewDataForPrefix(string previewPrefix)
+        {
+            foreach (var pair in _previewBatches)
+            {
+                if (pair.Key.StartsWith(previewPrefix, StringComparison.Ordinal) && pair.Value.Positions.Length > 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        internal static bool IsPreviewEnabled(string previewId)
+        {
+            return _previewBatches.TryGetValue(previewId, out var batch) && batch.Enabled;
+        }
+
+        internal static void SetPreviewEnabled(string previewId, bool enabled)
+        {
+            if (!_previewBatches.TryGetValue(previewId, out var batch))
+                return;
+
+            if (batch.Enabled == enabled)
+                return;
+
+            batch.Enabled = enabled;
+            SceneView.RepaintAll();
+        }
+
+        internal static void SetPreviewEnabledForPrefix(string previewPrefix, bool enabled)
+        {
+            bool changed = false;
+            foreach (var pair in _previewBatches)
+            {
+                if (!pair.Key.StartsWith(previewPrefix, StringComparison.Ordinal))
+                    continue;
+
+                if (pair.Value.Enabled == enabled)
+                    continue;
+
+                pair.Value.Enabled = enabled;
+                changed = true;
+            }
+
+            if (changed)
+                SceneView.RepaintAll();
+        }
+
+        internal static void GetPreviewCountsForPrefix(string previewPrefix, out int total, out int enabled)
+        {
+            total = 0;
+            enabled = 0;
+            foreach (var pair in _previewBatches)
+            {
+                if (!pair.Key.StartsWith(previewPrefix, StringComparison.Ordinal))
+                    continue;
+
+                total++;
+                if (pair.Value.Enabled)
+                    enabled++;
+            }
         }
 
         private static void BuildDrawArraysForMesh(Mesh mesh, float[] weights, out Vector3[]? outPositions, out Color[]? outColors)
         {
             var meshVertices = mesh.vertices;
-            int subMeshCount = mesh.subMeshCount;
-
-            // Count total triangles across all sub-meshes, capped per-mesh
-            int totalTriangles = 0;
-            for (int s = 0; s < subMeshCount; s++)
+            int vertexCount = meshVertices.Length;
+            if (vertexCount == 0)
             {
-                var desc = mesh.GetSubMesh(s);
-                if (desc.topology == MeshTopology.Triangles)
-                    totalTriangles += desc.indexCount / 3;
-            }
-            int triangleLimit = Mathf.Min(totalTriangles, MaxTrianglesPerMesh);
-
-            var positions = new Vector3[triangleLimit * 3];
-            var colors = new Color[triangleLimit * 3];
-
-            // Integer stride: sample every Nth triangle (N = totalTriangles / triangleLimit, rounded up)
-            int stride = totalTriangles > triangleLimit ? (totalTriangles + triangleLimit - 1) / triangleLimit : 1;
-
-            int outputTriangle = 0;
-            int globalTriangleIndex = 0;
-
-            for (int s = 0; s < subMeshCount && outputTriangle < triangleLimit; s++)
-            {
-                var desc = mesh.GetSubMesh(s);
-                if (desc.topology != MeshTopology.Triangles) continue;
-                var indices = mesh.GetTriangles(s);
-
-                for (int t = 0; t < indices.Length / 3 && outputTriangle < triangleLimit; t++, globalTriangleIndex++)
-                {
-                    // Sample only every Nth triangle
-                    if (globalTriangleIndex % stride != 0) continue;
-
-                    int i0 = indices[t * 3];
-                    int i1 = indices[t * 3 + 1];
-                    int i2 = indices[t * 3 + 2];
-
-                    int baseOut = outputTriangle * 3;
-                    positions[baseOut + 0] = meshVertices[i0];
-                    positions[baseOut + 1] = meshVertices[i1];
-                    positions[baseOut + 2] = meshVertices[i2];
-
-                    colors[baseOut + 0] = WeightToColor(i0 < weights.Length ? weights[i0] : 1f);
-                    colors[baseOut + 1] = WeightToColor(i1 < weights.Length ? weights[i1] : 1f);
-                    colors[baseOut + 2] = WeightToColor(i2 < weights.Length ? weights[i2] : 1f);
-
-                    outputTriangle++;
-                }
+                outPositions = Array.Empty<Vector3>();
+                outColors = Array.Empty<Color>();
+                return;
             }
 
-            // Trim to actual size if fewer triangles were sampled
-            if (outputTriangle < triangleLimit)
+            int vertexLimit = Mathf.Min(vertexCount, MaxVerticesPerMesh);
+            if (vertexLimit <= 0)
             {
-                Array.Resize(ref positions, outputTriangle * 3);
-                Array.Resize(ref colors, outputTriangle * 3);
+                outPositions = Array.Empty<Vector3>();
+                outColors = Array.Empty<Color>();
+                return;
+            }
+
+            var positions = new Vector3[vertexLimit];
+            var colors = new Color[vertexLimit];
+
+            // Integer stride: sample every Nth vertex (N = vertexCount / vertexLimit, rounded up)
+            int stride = vertexCount > vertexLimit ? (vertexCount + vertexLimit - 1) / vertexLimit : 1;
+            int outputVertex = 0;
+
+            for (int v = 0; v < vertexCount && outputVertex < vertexLimit; v += stride)
+            {
+                positions[outputVertex] = meshVertices[v];
+                colors[outputVertex] = WeightToColor(v < weights.Length ? weights[v] : 1f);
+                outputVertex++;
+            }
+
+            // Trim to actual size if fewer vertices were sampled
+            if (outputVertex < vertexLimit)
+            {
+                Array.Resize(ref positions, outputVertex);
+                Array.Resize(ref colors, outputVertex);
             }
 
             outPositions = positions;
@@ -164,16 +240,21 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         private static Color WeightToColor(float weight)
         {
             float t = Mathf.InverseLerp(1f, 10f, weight);
-            return Color.Lerp(Color.green, Color.red, t);
+            var palette = EditorPrefs.GetString("Meshia.Occlusion.ColorPalette", "Viridis");
+            Color c = palette switch
+            {
+                "BlueRed" => Color.Lerp(Color.blue, Color.red, t),
+                "GreenRed" => Color.Lerp(Color.green, Color.red, t),
+                _ => Viridis(t),
+            };
+            c.a = 0.95f;
+            return c;
         }
 
         private static void OnSceneGUI(SceneView sceneView)
         {
             if (Event.current.type != EventType.Repaint) return;
-            var positions = _positions;
-            var colors = _colors;
-
-            if (positions == null || colors == null || positions.Length == 0) return;
+            if (_previewBatches.Count == 0) return;
 
             Material? mat = GetGLMaterial();
             if (mat == null) return;
@@ -181,16 +262,57 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             mat.SetPass(0);
             GL.PushMatrix();
             GL.MultMatrix(Matrix4x4.identity);
-            GL.Begin(GL.TRIANGLES);
+            GL.Begin(GL.LINES);
 
-            for (int i = 0; i < positions.Length; i++)
+            var sceneCamera = sceneView.camera;
+            if (sceneCamera == null)
             {
-                GL.Color(colors[i]);
-                GL.Vertex(positions[i]);
+                GL.End();
+                GL.PopMatrix();
+                return;
+            }
+
+            Vector3 right = sceneCamera.transform.right;
+            Vector3 up = sceneCamera.transform.up;
+
+            int drawnVertices = 0;
+            int maxVertices = MaxVerticesTotal;
+            foreach (var pair in _previewBatches)
+            {
+                var batch = pair.Value;
+                if (!batch.Enabled) continue;
+
+                var positions = batch.Positions;
+                var colors = batch.Colors;
+                if (positions.Length == 0) continue;
+
+                int remaining = maxVertices - drawnVertices;
+                if (remaining <= 0) break;
+
+                int drawCount = Mathf.Min(remaining, positions.Length);
+
+                for (int i = 0; i < drawCount; i++)
+                {
+                    float markerScale = MarkerSize;
+                    Vector3 offsetRight = right * markerScale;
+                    Vector3 offsetUp = up * markerScale;
+
+                    GL.Color(colors[i]);
+                    // Draw a small cross to mark a single sampled vertex clearly from multiple view angles.
+                    GL.Vertex(positions[i] - offsetRight);
+                    GL.Vertex(positions[i] + offsetRight);
+                    GL.Vertex(positions[i] - offsetUp);
+                    GL.Vertex(positions[i] + offsetUp);
+                }
+
+                drawnVertices += drawCount;
             }
 
             GL.End();
             GL.PopMatrix();
+
+            if (drawnVertices > 0)
+                DrawLegendBar();
         }
 
         private static Material? _glMaterial;
@@ -207,6 +329,100 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             _glMaterial.SetInt("_ZWrite", 0);
             _glMaterial.SetInt("_ZTest", (int)CompareFunction.Always);
             return _glMaterial;
+        }
+
+        private static void DrawLegendBar()
+        {
+            Handles.BeginGUI();
+
+            var panelRect = new Rect(16f, 16f, 220f, 74f);
+            GUI.Box(panelRect, "Occlusion Weight");
+
+            var gradientRect = new Rect(panelRect.x + 10f, panelRect.y + 30f, panelRect.width - 20f, 16f);
+            GUI.DrawTexture(gradientRect, GetLegendTexture(), ScaleMode.StretchToFill, false);
+
+            var leftLabelRect = new Rect(gradientRect.x, gradientRect.yMax + 2f, 80f, 16f);
+            var rightLabelRect = new Rect(gradientRect.xMax - 100f, gradientRect.yMax + 2f, 100f, 16f);
+            GUI.Label(leftLabelRect, "Visible 1.0", EditorStyles.miniLabel);
+            GUI.Label(rightLabelRect, "Occluded 10.0", EditorStyles.miniLabel);
+
+            Handles.EndGUI();
+        }
+
+        private static Texture2D GetLegendTexture()
+        {
+            var palette = EditorPrefs.GetString("Meshia.Occlusion.ColorPalette", "Viridis");
+            if (_legendTexture != null && string.Equals(_legendPaletteKey, palette, StringComparison.Ordinal))
+                return _legendTexture;
+
+            if (_legendTexture != null)
+            {
+                UnityEngine.Object.DestroyImmediate(_legendTexture);
+                _legendTexture = null;
+            }
+
+            _legendTexture = new Texture2D(128, 1, TextureFormat.RGBA32, false)
+            {
+                hideFlags = HideFlags.HideAndDontSave,
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp
+            };
+
+            for (int x = 0; x < _legendTexture.width; x++)
+            {
+                float t = x / (_legendTexture.width - 1f);
+                Color c = palette switch
+                {
+                    "BlueRed" => Color.Lerp(Color.blue, Color.red, t),
+                    "GreenRed" => Color.Lerp(Color.green, Color.red, t),
+                    _ => Viridis(t),
+                };
+                _legendTexture.SetPixel(x, 0, c);
+            }
+            _legendTexture.Apply(false, true);
+            _legendPaletteKey = palette;
+
+            return _legendTexture;
+        }
+
+        // Viridis approximation (colorblind-friendly) — returns Color at t in [0,1]
+        private static Color Viridis(float t)
+        {
+            t = Mathf.Clamp01(t);
+            // coefficients from matplotlib viridis sampled stops
+            // simple polynomial interpolation between a few control points to avoid extra dependency
+            if (t < 0.25f)
+            {
+                // from deep blue to teal
+                float u = t / 0.25f;
+                return Color.Lerp(new Color(0.267f, 0.004f, 0.329f), new Color(0.229f, 0.322f, 0.545f), u);
+            }
+            else if (t < 0.5f)
+            {
+                float u = (t - 0.25f) / 0.25f;
+                return Color.Lerp(new Color(0.229f, 0.322f, 0.545f), new Color(0.127f, 0.566f, 0.550f), u);
+            }
+            else if (t < 0.75f)
+            {
+                float u = (t - 0.5f) / 0.25f;
+                return Color.Lerp(new Color(0.127f, 0.566f, 0.550f), new Color(0.713f, 0.862f, 0.343f), u);
+            }
+            else
+            {
+                float u = (t - 0.75f) / 0.25f;
+                return Color.Lerp(new Color(0.713f, 0.862f, 0.343f), new Color(0.993f, 0.906f, 0.143f), u);
+            }
+        }
+
+        private static int GetIntWithLegacyFallback(string key, string legacyKey, int fallback)
+        {
+            if (EditorPrefs.HasKey(key))
+                return EditorPrefs.GetInt(key, fallback);
+
+            if (EditorPrefs.HasKey(legacyKey))
+                return EditorPrefs.GetInt(legacyKey, fallback);
+
+            return fallback;
         }
     }
 }

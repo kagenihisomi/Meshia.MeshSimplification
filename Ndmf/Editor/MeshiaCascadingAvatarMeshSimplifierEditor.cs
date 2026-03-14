@@ -46,10 +46,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
             Undo.RecordObject(Target, "Get entries");
             try
-                {
-                    Target.RefreshEntries();
+            {
+                Target.RefreshEntries();
             }
-                catch (InvalidOperationException e)
+            catch (InvalidOperationException e)
             {
                 Debug.LogException(e, target);
                 return;
@@ -377,24 +377,32 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             // --- Occlusion-Weighted Simplification UI ---
             var occlusionWeightedToggle = root.Q<Toggle>("OcclusionWeightedToggle");
             var occlusionWeightStrengthSlider = root.Q<Slider>("OcclusionWeightStrengthSlider");
+            var openOcclusionPreviewSettingsButton = root.Q<Button>("OpenOcclusionPreviewSettingsButton");
             var previewOcclusionWeightsButton = root.Q<Button>("PreviewOcclusionWeightsButton");
+            var occlusionPreviewControlsContainer = root.Q<IMGUIContainer>("OcclusionPreviewControlsContainer");
 
-            if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null)
+            if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null && openOcclusionPreviewSettingsButton != null && occlusionPreviewControlsContainer != null)
             {
                 // Set initial visibility based on current serialized value
                 bool initialOcclusionEnabled = Target.UseOcclusionWeightedSimplification;
                 occlusionWeightStrengthSlider.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                openOcclusionPreviewSettingsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
                 previewOcclusionWeightsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                occlusionPreviewControlsContainer.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                occlusionPreviewControlsContainer.onGUIHandler = DrawOcclusionPreviewControls;
 
                 occlusionWeightedToggle.RegisterValueChangedCallback(evt =>
                 {
                     bool enabled = evt.newValue;
                     occlusionWeightStrengthSlider.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    openOcclusionPreviewSettingsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     previewOcclusionWeightsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    occlusionPreviewControlsContainer.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     if (!enabled)
                         OcclusionWeightGizmoDrawer.ClearPreviewData();
                 });
 
+                openOcclusionPreviewSettingsButton.clicked += OcclusionPreviewSettingsWindow.ShowWindow;
                 previewOcclusionWeightsButton.clicked += () => ComputeAndPreviewOcclusionWeights();
             }
 
@@ -1037,68 +1045,264 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
         }
 
+        private readonly struct OcclusionPreviewContext
+        {
+            public Renderer[] ActiveRenderers { get; }
+            public Bounds[] ActiveBounds { get; }
+            public Bounds[] OccluderBuffer { get; }
+
+            public OcclusionPreviewContext(Renderer[] activeRenderers, Bounds[] activeBounds, Bounds[] occluderBuffer)
+            {
+                ActiveRenderers = activeRenderers;
+                ActiveBounds = activeBounds;
+                OccluderBuffer = occluderBuffer;
+            }
+        }
+
+        private static Renderer ResolveRendererForCurrentPreviewState(Renderer renderer)
+        {
+            if (!MeshiaCascadingAvatarMeshSimplifierPreview.IsEnabled())
+                return renderer;
+
+            return MeshiaCascadingAvatarMeshSimplifierPreview.TryGetPreviewRenderer(renderer, out var previewRenderer)
+                ? previewRenderer
+                : renderer;
+        }
+
+        private static string GetGroupPreviewPrefix(string groupName) => $"mesh::{groupName}::";
+        private static string GetMeshPreviewId(MeshiaCascadingAvatarMeshSimplifierRendererEntry entry)
+            => $"mesh::{entry.CostumeGroup}::{entry.RendererObjectReference.referencePath}";
+
+        private IEnumerable<MeshiaCascadingAvatarMeshSimplifierRendererEntry> EnumerateValidOcclusionEntries(string? groupName = null)
+        {
+            foreach (var entry in Target.Entries)
+            {
+                if (!entry.IsValid(Target) || !entry.Enabled)
+                    continue;
+
+                if (groupName != null && !string.Equals(entry.CostumeGroup, groupName, StringComparison.Ordinal))
+                    continue;
+
+                if (entry.GetTargetRenderer(Target) is not SkinnedMeshRenderer)
+                    continue;
+
+                yield return entry;
+            }
+        }
+
+        private bool TryCreateOcclusionPreviewContext(out OcclusionPreviewContext context)
+        {
+            context = default;
+            var avatarRoot = Target.transform.parent?.gameObject;
+            if (avatarRoot == null)
+            {
+                Debug.LogWarning("[Meshia] Cannot preview occlusion weights: component must be a child of the avatar root GameObject.");
+                return false;
+            }
+
+            var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
+            var activeRenderers = System.Array.FindAll(allRenderers, r => r.gameObject.activeInHierarchy && r.enabled);
+
+            var resolvedRenderers = new Renderer[activeRenderers.Length];
+            var activeBounds = new Bounds[activeRenderers.Length];
+            for (int i = 0; i < activeRenderers.Length; i++)
+            {
+                var resolved = ResolveRendererForCurrentPreviewState(activeRenderers[i]);
+                resolvedRenderers[i] = resolved;
+                activeBounds[i] = resolved.bounds;
+            }
+
+            context = new OcclusionPreviewContext(
+                resolvedRenderers,
+                activeBounds,
+                new Bounds[Mathf.Max(0, resolvedRenderers.Length - 1)]);
+            return true;
+        }
+
+        private bool BuildAndStoreOcclusionPreviewForEntry(MeshiaCascadingAvatarMeshSimplifierRendererEntry entry, in OcclusionPreviewContext context)
+        {
+            if (entry.GetTargetRenderer(Target) is not Renderer baseRenderer)
+                return false;
+
+            var resolvedRenderer = ResolveRendererForCurrentPreviewState(baseRenderer);
+            if (resolvedRenderer is not SkinnedMeshRenderer smr)
+                return false;
+
+            string previewId = GetMeshPreviewId(entry);
+            var bakedMesh = new Mesh();
+            try
+            {
+                smr.BakeMesh(bakedMesh);
+
+                var localToWorld = smr.transform.localToWorldMatrix;
+                var verts = bakedMesh.vertices;
+                for (int v = 0; v < verts.Length; v++)
+                    verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
+                bakedMesh.vertices = verts;
+
+                int occluderCount = 0;
+                for (int i = 0; i < context.ActiveRenderers.Length; i++)
+                {
+                    if (ReferenceEquals(context.ActiveRenderers[i], smr))
+                        continue;
+
+                    context.OccluderBuffer[occluderCount] = context.ActiveBounds[i];
+                    occluderCount++;
+                }
+
+                var weights = OcclusionVertexWeighter.ComputeWeights(bakedMesh, context.OccluderBuffer, occluderCount, Target.OcclusionWeightStrength);
+                OcclusionWeightGizmoDrawer.SetPreviewData(previewId, bakedMesh, weights, true);
+                return true;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Failed to compute occlusion weights for renderer '{smr.name}': {e}");
+                return false;
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(bakedMesh);
+            }
+        }
+
+        private void DrawOcclusionPreviewControls()
+        {
+            if (!Target.UseOcclusionWeightedSimplification)
+                return;
+
+            EditorGUILayout.Space(4);
+            EditorGUILayout.LabelField("Occlusion Preview Controls", EditorStyles.boldLabel);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Preview All"))
+                {
+                    ComputeAndPreviewOcclusionWeights();
+                }
+                if (GUILayout.Button("Show All"))
+                {
+                    OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix("mesh::", true);
+                }
+                if (GUILayout.Button("Hide All"))
+                {
+                    OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix("mesh::", false);
+                }
+                if (GUILayout.Button("Clear All"))
+                {
+                    OcclusionWeightGizmoDrawer.ClearPreviewData();
+                }
+            }
+
+            foreach (var costumeGroup in Target.CostumeGroups)
+            {
+                string groupName = costumeGroup.GroupName;
+                string groupPrefix = GetGroupPreviewPrefix(groupName);
+
+                OcclusionWeightGizmoDrawer.GetPreviewCountsForPrefix(groupPrefix, out int totalGroupPreviews, out int enabledGroupPreviews);
+                bool hasGroupPreview = totalGroupPreviews > 0;
+
+                using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+                {
+                    EditorGUILayout.LabelField(
+                        $"{groupName} (shown {enabledGroupPreviews}/{Mathf.Max(totalGroupPreviews, 0)})",
+                        EditorStyles.boldLabel);
+
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        if (GUILayout.Button("Preview Group"))
+                        {
+                            ComputeAndPreviewOcclusionWeights(groupName);
+                        }
+
+                        using (new EditorGUI.DisabledScope(!hasGroupPreview))
+                        {
+                            if (GUILayout.Button(enabledGroupPreviews > 0 ? "Hide Group" : "Show Group"))
+                            {
+                                OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix(groupPrefix, enabledGroupPreviews == 0);
+                            }
+                            if (GUILayout.Button("Clear Group"))
+                            {
+                                OcclusionWeightGizmoDrawer.RemovePreviewDataForPrefix(groupPrefix);
+                            }
+                        }
+                    }
+
+                    foreach (var entry in EnumerateValidOcclusionEntries(groupName))
+                    {
+                        string previewId = GetMeshPreviewId(entry);
+                        bool hasPreview = OcclusionWeightGizmoDrawer.HasPreviewData(previewId);
+                        bool isEnabled = OcclusionWeightGizmoDrawer.IsPreviewEnabled(previewId);
+                        string rendererName = entry.GetTargetRenderer(Target)?.name ?? entry.RendererObjectReference.referencePath;
+
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            GUILayout.Space(12);
+                            EditorGUILayout.LabelField(rendererName, GUILayout.MinWidth(140));
+
+                            if (GUILayout.Button(hasPreview ? "Rebuild" : "Build", GUILayout.Width(60)))
+                            {
+                                ComputeAndPreviewOcclusionWeightsForEntry(entry);
+                            }
+
+                            using (new EditorGUI.DisabledScope(!hasPreview))
+                            {
+                                bool nextEnabled = EditorGUILayout.ToggleLeft("Show", isEnabled, GUILayout.Width(60));
+                                if (nextEnabled != isEnabled)
+                                {
+                                    OcclusionWeightGizmoDrawer.SetPreviewEnabled(previewId, nextEnabled);
+                                }
+                                if (GUILayout.Button("Clear", GUILayout.Width(50)))
+                                {
+                                    OcclusionWeightGizmoDrawer.RemovePreviewData(previewId);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private void ComputeAndPreviewOcclusionWeightsForEntry(MeshiaCascadingAvatarMeshSimplifierRendererEntry entry)
+        {
+            if (!Target.UseOcclusionWeightedSimplification)
+                return;
+
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            BuildAndStoreOcclusionPreviewForEntry(entry, context);
+        }
+
+        private void ComputeAndPreviewOcclusionWeights(string costumeGroup)
+        {
+            if (!Target.UseOcclusionWeightedSimplification)
+                return;
+
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            foreach (var entry in EnumerateValidOcclusionEntries(costumeGroup))
+            {
+                BuildAndStoreOcclusionPreviewForEntry(entry, context);
+            }
+        }
+
         /// <summary>
-        /// Computes per-vertex occlusion weights for all entries and sends the first valid
-        /// SkinnedMeshRenderer's data to <see cref="OcclusionWeightGizmoDrawer"/> for Scene View preview.
+        /// Computes per-vertex occlusion weights for all valid SkinnedMeshRenderer entries
+        /// and appends their sampled vertex previews to <see cref="OcclusionWeightGizmoDrawer"/>.
         /// </summary>
         private void ComputeAndPreviewOcclusionWeights()
         {
             var target = Target;
             if (!target.UseOcclusionWeightedSimplification) return;
 
-            // The component must be a child of the avatar root
-            var avatarRoot = target.transform.parent?.gameObject;
-            if (avatarRoot == null)
-            {
-                Debug.LogWarning("[Meshia] Cannot preview occlusion weights: component must be a child of the avatar root GameObject.");
-                return;
-            }
-
-            // Collect all active, enabled renderers on the avatar
-            var allRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
-            var activeRenderers = System.Array.FindAll(allRenderers, r => r.gameObject.activeInHierarchy && r.enabled);
-
-            // Start fresh preview data so we can append multiple meshes
             OcclusionWeightGizmoDrawer.ClearPreviewData();
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
 
-            foreach (var entry in target.Entries)
+            foreach (var entry in EnumerateValidOcclusionEntries())
             {
-                if (!entry.IsValid(target) || !entry.Enabled) continue;
-                if (entry.GetTargetRenderer(target) is not SkinnedMeshRenderer smr) continue;
-
-                Debug.Log($"Processing entry for renderer reference path '{entry.RendererObjectReference.referencePath}'");
-                var bakedMesh = new Mesh();
-                try
-                {
-                    smr.BakeMesh(bakedMesh);
-
-                    // Transform vertices to world space
-                    var localToWorld = smr.transform.localToWorldMatrix;
-                    var verts = bakedMesh.vertices;
-                    for (int v = 0; v < verts.Length; v++)
-                        verts[v] = localToWorld.MultiplyPoint3x4(verts[v]);
-                    bakedMesh.vertices = verts;
-
-                    // Collect occluder bounds: all active renderers except this one (by reference equality)
-                    var occluderList = new System.Collections.Generic.List<Bounds>();
-                    foreach (var r in activeRenderers)
-                    {
-                        if (!ReferenceEquals(r, smr))
-                            occluderList.Add(r.bounds);
-                    }
-
-                    var weights = OcclusionVertexWeighter.ComputeWeights(bakedMesh, occluderList.ToArray(), target.OcclusionWeightStrength);
-                    OcclusionWeightGizmoDrawer.AppendPreviewData(bakedMesh, weights);
-                }
-                catch (Exception e)
-                {
-                    Debug.LogError($"Failed to compute occlusion weights for renderer '{smr.name}': {e}");
-                }
-                finally
-                {
-                    Debug.Log("Cleaning up baked mesh.");
-                    // UnityEngine.Object.DestroyImmediate(bakedMesh);
-                }
+                BuildAndStoreOcclusionPreviewForEntry(entry, context);
             }
         }
 
