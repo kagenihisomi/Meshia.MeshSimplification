@@ -1540,7 +1540,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         /// <summary>
         /// Computes per-vertex occlusion weights for all valid SkinnedMeshRenderer entries
-        /// and appends their sampled vertex previews to <see cref="OcclusionPreviewRenderer"/>.
+        /// and creates preview GameObjects with vertex-colored meshes via <see cref="OcclusionPreviewRenderer"/>.
         /// </summary>
         private void ComputeAndPreviewOcclusionWeights()
         {

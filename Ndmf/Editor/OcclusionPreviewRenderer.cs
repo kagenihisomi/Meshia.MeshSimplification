@@ -335,7 +335,17 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             if (shader == null)
             {
                 Debug.LogError("[Meshia] Could not find a vertex color shader for occlusion preview.");
-                _vertexColorMaterial = new Material(Shader.Find("Standard")!) { hideFlags = HideFlags.DontSave };
+                var fallbackShader = Shader.Find("Standard");
+                if (fallbackShader == null)
+                {
+                    // Absolute last resort — create a material with no shader.
+                    // This should never happen in practice but prevents a null reference.
+                    _vertexColorMaterial = new Material("") { hideFlags = HideFlags.DontSave };
+                }
+                else
+                {
+                    _vertexColorMaterial = new Material(fallbackShader) { hideFlags = HideFlags.DontSave };
+                }
                 return _vertexColorMaterial;
             }
 
