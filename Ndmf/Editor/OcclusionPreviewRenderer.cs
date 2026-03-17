@@ -15,13 +15,18 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
     /// in the Hierarchy, and show the exact world-space mesh that occlusion is computed on.
     ///
     /// Per-vertex weights are baked into the mesh's vertex color channel.  A vertex-color
-    /// material ("Particles/Standard Unlit" with vertex colors) renders the heatmap directly.
+    /// material renders the heatmap directly.
+    ///
+    /// Color scale:
+    ///   Purple/Blue (weight 1.0) = Visible / Preserved — low simplification priority.
+    ///   Yellow      (weight 10.0) = Occluded / Simplified — high simplification priority.
     /// </summary>
     [InitializeOnLoad]
     internal static class OcclusionPreviewRenderer
     {
         private const float ContrastGamma = 0.55f;
         private const string PreviewRootName = "MeshiaOcclusionPreview";
+        private const string OccluderRootName = "MeshiaOcclusionOccluders";
 
         private sealed class PreviewEntry
         {
@@ -43,7 +48,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         private static readonly Dictionary<string, PreviewEntry> _entries = new();
         private static GameObject? _previewRoot;
+        private static GameObject? _occluderRoot;
+        private static readonly List<GameObject> _occluderDebugObjects = new();
         private static Material? _vertexColorMaterial;
+        private static Material? _occluderDebugMaterial;
 
         static OcclusionPreviewRenderer()
         {
@@ -53,7 +61,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  Public API (mirrors OcclusionWeightGizmoDrawer for drop-in swap)
+        //  Public API
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
@@ -79,7 +87,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             // Create the preview GameObject.
             var go = new GameObject($"OcclusionPreview_{previewId}")
             {
-                hideFlags = HideFlags.DontSave | HideFlags.NotEditable,
+                hideFlags = HideFlags.DontSave,
             };
             go.transform.SetParent(root.transform, false);
             // Mesh is already in world space, so identity transform.
@@ -100,6 +108,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             var entry = new PreviewEntry(previewId, go, filter, renderer, previewMesh);
             _entries[previewId] = entry;
+
+            Debug.Log($"[Meshia] Created occlusion preview '{previewId}': {worldSpaceMesh.vertexCount} verts, {worldSpaceMesh.triangles.Length / 3} tris, weight range [{GetMinWeight(simplificationWeights):F2}, {GetMaxWeight(simplificationWeights):F2}]");
         }
 
         internal static void SetPreviewData(Mesh worldSpaceMesh, float[] simplificationWeights)
@@ -113,6 +123,82 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             SetPreviewData(id, worldSpaceMesh, simplificationWeights, true);
         }
 
+        /// <summary>
+        /// Creates debug GameObjects for each occluder mesh, rendered as semi-transparent
+        /// wireframe-like objects so the user can verify which clothing meshes participate
+        /// in occlusion testing.
+        /// </summary>
+        internal static void ShowOccluderDebugMeshes(Mesh[] occluderWorldMeshes, string[] labels)
+        {
+            ClearOccluderDebugMeshes();
+
+            if (occluderWorldMeshes == null || occluderWorldMeshes.Length == 0)
+            {
+                Debug.LogWarning("[Meshia] No occluder meshes to show.");
+                return;
+            }
+
+            var root = GetOrCreateOccluderRoot();
+            for (int i = 0; i < occluderWorldMeshes.Length; i++)
+            {
+                var srcMesh = occluderWorldMeshes[i];
+                if (srcMesh == null || srcMesh.vertexCount == 0) continue;
+
+                // Clone mesh so we can safely manage its lifetime.
+                var debugMesh = new Mesh
+                {
+                    hideFlags = HideFlags.DontSave,
+                    vertices = srcMesh.vertices,
+                    triangles = srcMesh.triangles,
+                };
+                debugMesh.RecalculateNormals();
+                debugMesh.RecalculateBounds();
+
+                string label = i < labels.Length ? labels[i] : $"Occluder_{i}";
+                var go = new GameObject($"Occluder_{label}")
+                {
+                    hideFlags = HideFlags.DontSave,
+                };
+                go.transform.SetParent(root.transform, false);
+                go.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+                go.transform.localScale = Vector3.one;
+
+                var filter = go.AddComponent<MeshFilter>();
+                filter.sharedMesh = debugMesh;
+
+                var renderer = go.AddComponent<MeshRenderer>();
+                renderer.sharedMaterial = GetOccluderDebugMaterial();
+                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                renderer.receiveShadows = false;
+
+                _occluderDebugObjects.Add(go);
+            }
+
+            int count = _occluderDebugObjects.Count;
+            Debug.Log($"[Meshia] Showing {count} occluder debug meshes under '{OccluderRootName}'.");
+        }
+
+        internal static void ClearOccluderDebugMeshes()
+        {
+            foreach (var go in _occluderDebugObjects)
+            {
+                if (go != null)
+                {
+                    var mf = go.GetComponent<MeshFilter>();
+                    if (mf != null && mf.sharedMesh != null)
+                        UnityEngine.Object.DestroyImmediate(mf.sharedMesh);
+                    UnityEngine.Object.DestroyImmediate(go);
+                }
+            }
+            _occluderDebugObjects.Clear();
+
+            if (_occluderRoot != null)
+            {
+                UnityEngine.Object.DestroyImmediate(_occluderRoot);
+                _occluderRoot = null;
+            }
+        }
+
         internal static void ClearPreviewData()
         {
             foreach (var pair in _entries)
@@ -124,6 +210,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 UnityEngine.Object.DestroyImmediate(_previewRoot);
                 _previewRoot = null;
             }
+
+            ClearOccluderDebugMeshes();
         }
 
         internal static void RemovePreviewData(string previewId)
@@ -207,6 +295,22 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         //  Internal helpers
         // ─────────────────────────────────────────────────────────────────────
 
+        private static float GetMinWeight(float[] weights)
+        {
+            if (weights == null || weights.Length == 0) return 0f;
+            float min = float.MaxValue;
+            foreach (var w in weights) if (w < min) min = w;
+            return min;
+        }
+
+        private static float GetMaxWeight(float[] weights)
+        {
+            if (weights == null || weights.Length == 0) return 0f;
+            float max = float.MinValue;
+            foreach (var w in weights) if (w > max) max = w;
+            return max;
+        }
+
         private static GameObject GetOrCreatePreviewRoot()
         {
             if (_previewRoot != null)
@@ -214,10 +318,23 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             _previewRoot = new GameObject(PreviewRootName)
             {
-                hideFlags = HideFlags.DontSave | HideFlags.NotEditable,
+                hideFlags = HideFlags.DontSave,
             };
             _previewRoot.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
             return _previewRoot;
+        }
+
+        private static GameObject GetOrCreateOccluderRoot()
+        {
+            if (_occluderRoot != null)
+                return _occluderRoot;
+
+            _occluderRoot = new GameObject(OccluderRootName)
+            {
+                hideFlags = HideFlags.DontSave,
+            };
+            _occluderRoot.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            return _occluderRoot;
         }
 
         private static void CleanupEmptyRoot()
@@ -315,37 +432,29 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         }
 
         /// <summary>
-        /// Returns a shared vertex-color material.  Uses "Particles/Standard Unlit"
-        /// which supports vertex colors out of the box in both Built-in and URP pipelines.
-        /// Falls back to a simple unlit colored shader if the particles shader isn't available.
+        /// Returns a shared vertex-color unlit material.
+        /// Uses "Hidden/Internal-Colored" which renders vertex colors directly without
+        /// lighting, ensuring the heatmap is clearly visible regardless of scene lighting.
         /// </summary>
         private static Material GetVertexColorMaterial()
         {
             if (_vertexColorMaterial != null)
                 return _vertexColorMaterial;
 
-            // Try Particles/Standard Unlit first (supports vertex colors natively).
-            var shader = Shader.Find("Particles/Standard Unlit");
+            // Use the Internal-Colored shader which renders vertex colors directly.
+            // This is more reliable than Particles/Standard Unlit for vertex color display.
+            var shader = Shader.Find("Hidden/Internal-Colored");
             if (shader == null)
             {
-                // Fallback to the internal colored shader used for GL drawing.
-                shader = Shader.Find("Hidden/Internal-Colored");
+                // Fallback to Particles/Standard Unlit.
+                shader = Shader.Find("Particles/Standard Unlit");
             }
 
             if (shader == null)
             {
                 Debug.LogError("[Meshia] Could not find a vertex color shader for occlusion preview.");
                 var fallbackShader = Shader.Find("Standard");
-                if (fallbackShader == null)
-                {
-                    // Absolute last resort — create a material with no shader.
-                    // This should never happen in practice but prevents a null reference.
-                    _vertexColorMaterial = new Material("") { hideFlags = HideFlags.DontSave };
-                }
-                else
-                {
-                    _vertexColorMaterial = new Material(fallbackShader) { hideFlags = HideFlags.DontSave };
-                }
+                _vertexColorMaterial = new Material(fallbackShader != null ? fallbackShader : Shader.Find("UI/Default")!) { hideFlags = HideFlags.DontSave };
                 return _vertexColorMaterial;
             }
 
@@ -354,19 +463,58 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 hideFlags = HideFlags.DontSave,
             };
 
-            // Configure for vertex-color rendering.
-            if (shader.name == "Particles/Standard Unlit")
+            if (shader.name == "Hidden/Internal-Colored")
+            {
+                // Internal-Colored renders vertex colors directly.
+                _vertexColorMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.One);
+                _vertexColorMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.Zero);
+                _vertexColorMaterial.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Back);
+                _vertexColorMaterial.SetInt("_ZWrite", 1);
+                _vertexColorMaterial.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.LessEqual);
+            }
+            else if (shader.name == "Particles/Standard Unlit")
             {
                 // Enable vertex color stream.
                 _vertexColorMaterial.SetFloat("_ColorMode", 1f); // Multiply
                 _vertexColorMaterial.SetColor("_Color", Color.white);
                 _vertexColorMaterial.SetFloat("_Mode", 0f); // Opaque
-                // Disable soft particles and depth fading.
                 _vertexColorMaterial.SetFloat("_SoftParticlesEnabled", 0f);
                 _vertexColorMaterial.SetFloat("_CameraFadingEnabled", 0f);
             }
 
             return _vertexColorMaterial;
+        }
+
+        /// <summary>
+        /// Returns a semi-transparent material for occluder debug visualization.
+        /// </summary>
+        private static Material GetOccluderDebugMaterial()
+        {
+            if (_occluderDebugMaterial != null)
+                return _occluderDebugMaterial;
+
+            var shader = Shader.Find("Hidden/Internal-Colored");
+            if (shader == null)
+                shader = Shader.Find("Particles/Standard Unlit");
+            if (shader == null)
+                shader = Shader.Find("Standard");
+
+            _occluderDebugMaterial = new Material(shader!)
+            {
+                hideFlags = HideFlags.DontSave,
+                color = new Color(0.3f, 0.6f, 1.0f, 0.25f), // semi-transparent blue
+            };
+
+            if (shader!.name == "Hidden/Internal-Colored")
+            {
+                _occluderDebugMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                _occluderDebugMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                _occluderDebugMaterial.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Back);
+                _occluderDebugMaterial.SetInt("_ZWrite", 0);
+                _occluderDebugMaterial.SetInt("_ZTest", (int)UnityEngine.Rendering.CompareFunction.LessEqual);
+            }
+
+            return _occluderDebugMaterial;
         }
     }
 }

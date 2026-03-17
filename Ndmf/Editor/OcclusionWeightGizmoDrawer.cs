@@ -357,10 +357,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var gradientRect = new Rect(panelRect.x + 10f, panelRect.y + 30f, panelRect.width - 20f, 16f);
             GUI.DrawTexture(gradientRect, GetLegendTexture(), ScaleMode.StretchToFill, false);
 
-            var leftLabelRect = new Rect(gradientRect.x, gradientRect.yMax + 2f, 80f, 16f);
-            var rightLabelRect = new Rect(gradientRect.xMax - 100f, gradientRect.yMax + 2f, 100f, 16f);
-            GUI.Label(leftLabelRect, "Visible 1.0", EditorStyles.miniLabel);
-            GUI.Label(rightLabelRect, "Occluded 10.0", EditorStyles.miniLabel);
+            var leftLabelRect = new Rect(gradientRect.x, gradientRect.yMax + 2f, 100f, 16f);
+            var rightLabelRect = new Rect(gradientRect.xMax - 120f, gradientRect.yMax + 2f, 120f, 16f);
+            GUI.Label(leftLabelRect, "Preserved 1.0", EditorStyles.miniLabel);
+            GUI.Label(rightLabelRect, "Simplified 10.0", EditorStyles.miniLabel);
 
             Handles.EndGUI();
         }

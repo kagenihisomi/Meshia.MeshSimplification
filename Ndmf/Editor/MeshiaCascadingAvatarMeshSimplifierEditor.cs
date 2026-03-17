@@ -404,6 +404,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var occlusionWeightStrengthSlider = root.Q<Slider>("OcclusionWeightStrengthSlider");
             var openOcclusionPreviewSettingsButton = root.Q<Button>("OpenOcclusionPreviewSettingsButton");
             var previewOcclusionWeightsButton = root.Q<Button>("PreviewOcclusionWeightsButton");
+            var occlusionLegendHelpBox = root.Q<HelpBox>("OcclusionLegendHelpBox");
 
             if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null && openOcclusionPreviewSettingsButton != null)
             {
@@ -412,6 +413,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 occlusionWeightStrengthSlider.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
                 openOcclusionPreviewSettingsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
                 previewOcclusionWeightsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                if (occlusionLegendHelpBox != null)
+                    occlusionLegendHelpBox.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
 
                 occlusionWeightedToggle.RegisterValueChangedCallback(evt =>
                 {
@@ -419,6 +422,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     occlusionWeightStrengthSlider.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     openOcclusionPreviewSettingsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     previewOcclusionWeightsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    if (occlusionLegendHelpBox != null)
+                        occlusionLegendHelpBox.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     if (!enabled)
                         OcclusionPreviewRenderer.ClearPreviewData();
                 });
@@ -1313,6 +1318,41 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 }
             }
 
+            /// <summary>
+            /// Returns clones of all occluder world-space meshes and their labels for debug display.
+            /// The caller is responsible for the lifetime of the returned Mesh objects.
+            /// </summary>
+            public void GetOccluderDebugMeshes(Renderer targetOriginal, out Mesh[] meshes, out string[] labels)
+            {
+                // Find the source renderer for the target so we can exclude self.
+                Renderer? targetSource = null;
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, targetOriginal))
+                    {
+                        targetSource = e.Source;
+                        break;
+                    }
+                }
+
+                var meshList = new List<Mesh>();
+                var labelList = new List<string>();
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, targetOriginal))
+                        continue;
+                    if (targetSource != null && ReferenceEquals(e.Source, targetSource))
+                        continue;
+                    if (e.TempMesh == null || e.TempMesh.vertexCount == 0)
+                        continue;
+
+                    meshList.Add(e.TempMesh);
+                    labelList.Add(e.Source != null ? e.Source.name : "Unknown");
+                }
+                meshes = meshList.ToArray();
+                labels = labelList.ToArray();
+            }
+
             public void Dispose()
             {
                 foreach (var e in _entries)
@@ -1373,23 +1413,39 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         private bool BuildAndStoreOcclusionPreviewForEntry(
             MeshiaCascadingAvatarMeshSimplifierRendererEntry entry,
-            OcclusionPreviewContext context)
+            OcclusionPreviewContext context,
+            bool showOccluderDebugMeshes = false)
         {
             if (entry.GetTargetRenderer(Target) is not Renderer originalRenderer)
                 return false;
 
             if (!TryResolveOcclusionPreviewSourceRenderer(originalRenderer, out var sourceRenderer, out var sourceKind))
+            {
+                Debug.LogWarning($"[Meshia] Could not resolve source renderer for '{originalRenderer.name}' — skipping occlusion preview.");
                 return false;
+            }
 
             string previewId = GetMeshPreviewId(entry);
             if (!TryBuildWorldSpaceMeshFromRenderer(sourceRenderer, sourceKind, out var targetWorldMesh))
+            {
+                Debug.LogWarning($"[Meshia] Could not build world-space mesh for '{sourceRenderer.name}' — skipping occlusion preview.");
                 return false;
+            }
 
             try
             {
                 // Retrieve external occluder colliders (all resolved source meshes except self).
                 var colliderBuffer = new MeshCollider[context.Count];
                 context.GetExternalColliders(originalRenderer, colliderBuffer, out int colliderCount);
+
+                Debug.Log($"[Meshia] Computing occlusion for '{originalRenderer.name}' (source: {sourceKind}): {targetWorldMesh.vertexCount} verts, {colliderCount} external occluders, strength={Target.OcclusionWeightStrength:F2}");
+
+                // Optionally show occluder debug meshes so the user can verify clothing participation.
+                if (showOccluderDebugMeshes)
+                {
+                    context.GetOccluderDebugMeshes(originalRenderer, out var debugMeshes, out var debugLabels);
+                    OcclusionPreviewRenderer.ShowOccluderDebugMeshes(debugMeshes, debugLabels);
+                }
 
                 // Fibonacci sphere raycasting over the current NDMF preview/avatar state.
                 var weights = OcclusionVertexWeighter.ComputeWeights(
@@ -1416,6 +1472,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             EditorGUILayout.Space(4);
             EditorGUILayout.LabelField("Occlusion Preview Controls", EditorStyles.boldLabel);
 
+            // Color legend help box
+            EditorGUILayout.HelpBox(
+                "Purple/Blue = Visible (preserved, low simplification priority)\n" +
+                "Yellow/Green = Occluded (simplified more aggressively)\n\n" +
+                "Preview creates real GameObjects under 'MeshiaOcclusionPreview' in the Hierarchy.\n" +
+                "The mesh shown is the exact world-space geometry used for raycasting.",
+                MessageType.Info);
+
             using (new EditorGUILayout.HorizontalScope())
             {
                 if (GUILayout.Button("Preview All"))
@@ -1433,6 +1497,18 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 if (GUILayout.Button("Clear All"))
                 {
                     OcclusionPreviewRenderer.ClearPreviewData();
+                }
+            }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Show Occluder Meshes"))
+                {
+                    ShowOccluderDebugMeshes();
+                }
+                if (GUILayout.Button("Hide Occluder Meshes"))
+                {
+                    OcclusionPreviewRenderer.ClearOccluderDebugMeshes();
                 }
             }
 
@@ -1555,6 +1631,35 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             {
                 foreach (var entry in EnumerateValidOcclusionEntries())
                     BuildAndStoreOcclusionPreviewForEntry(entry, context);
+            }
+        }
+
+        /// <summary>
+        /// Shows semi-transparent debug GameObjects for all occluder meshes
+        /// (clothing, accessories) so the user can verify which meshes participate
+        /// in the occlusion calculation.
+        /// </summary>
+        private void ShowOccluderDebugMeshes()
+        {
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            using (context)
+            {
+                // Pick the first valid entry as the "target" so we can see external occluders.
+                var firstEntry = EnumerateValidOcclusionEntries().GetEnumerator();
+                if (!firstEntry.MoveNext())
+                {
+                    Debug.LogWarning("[Meshia] No valid occlusion entries to show occluders for.");
+                    return;
+                }
+
+                var entry = firstEntry.Current;
+                if (entry.GetTargetRenderer(Target) is not Renderer originalRenderer)
+                    return;
+
+                context.GetOccluderDebugMeshes(originalRenderer, out var debugMeshes, out var debugLabels);
+                OcclusionPreviewRenderer.ShowOccluderDebugMeshes(debugMeshes, debugLabels);
             }
         }
 
