@@ -1218,7 +1218,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 var list = new List<ColEntry>(originalRenderers.Length);
                 // Track resolved source renderers to prevent duplicate colliders when
                 // both an original and its NDMF preview proxy appear in the input list.
-                var usedSources = new HashSet<Renderer>();
+                var usedSources = new HashSet<Renderer>(originalRenderers.Length);
 
                 foreach (var originalRenderer in originalRenderers)
                 {
