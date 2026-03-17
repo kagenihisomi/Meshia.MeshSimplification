@@ -454,7 +454,15 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             {
                 Debug.LogError("[Meshia] Could not find a vertex color shader for occlusion preview.");
                 var fallbackShader = Shader.Find("Standard");
-                _vertexColorMaterial = new Material(fallbackShader != null ? fallbackShader : Shader.Find("UI/Default")!) { hideFlags = HideFlags.DontSave };
+                if (fallbackShader == null)
+                    fallbackShader = Shader.Find("UI/Default");
+                if (fallbackShader == null)
+                {
+                    Debug.LogError("[Meshia] No usable shader found at all. Occlusion preview will not render.");
+                    _vertexColorMaterial = new Material(Shader.Find("Sprites/Default")!) { hideFlags = HideFlags.DontSave };
+                    return _vertexColorMaterial;
+                }
+                _vertexColorMaterial = new Material(fallbackShader) { hideFlags = HideFlags.DontSave };
                 return _vertexColorMaterial;
             }
 
@@ -499,13 +507,20 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             if (shader == null)
                 shader = Shader.Find("Standard");
 
-            _occluderDebugMaterial = new Material(shader!)
+            if (shader == null)
+            {
+                Debug.LogError("[Meshia] No shader found for occluder debug material.");
+                _occluderDebugMaterial = new Material(Shader.Find("Sprites/Default")!) { hideFlags = HideFlags.DontSave };
+                return _occluderDebugMaterial;
+            }
+
+            _occluderDebugMaterial = new Material(shader)
             {
                 hideFlags = HideFlags.DontSave,
                 color = new Color(0.3f, 0.6f, 1.0f, 0.25f), // semi-transparent blue
             };
 
-            if (shader!.name == "Hidden/Internal-Colored")
+            if (shader.name == "Hidden/Internal-Colored")
             {
                 _occluderDebugMaterial.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
                 _occluderDebugMaterial.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);

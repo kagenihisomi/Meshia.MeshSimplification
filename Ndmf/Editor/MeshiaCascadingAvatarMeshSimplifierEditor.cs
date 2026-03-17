@@ -1421,14 +1421,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             if (!TryResolveOcclusionPreviewSourceRenderer(originalRenderer, out var sourceRenderer, out var sourceKind))
             {
-                Debug.LogWarning($"[Meshia] Could not resolve source renderer for '{originalRenderer.name}' — skipping occlusion preview.");
+                Debug.LogWarning($"[Meshia] Could not resolve source renderer for '{originalRenderer.name}' - skipping occlusion preview.");
                 return false;
             }
 
             string previewId = GetMeshPreviewId(entry);
             if (!TryBuildWorldSpaceMeshFromRenderer(sourceRenderer, sourceKind, out var targetWorldMesh))
             {
-                Debug.LogWarning($"[Meshia] Could not build world-space mesh for '{sourceRenderer.name}' — skipping occlusion preview.");
+                Debug.LogWarning($"[Meshia] Could not build world-space mesh for '{sourceRenderer.name}' - skipping occlusion preview.");
                 return false;
             }
 
