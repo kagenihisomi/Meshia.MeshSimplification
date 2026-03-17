@@ -202,7 +202,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 foreach (var costumeGroup in target.CostumeGroups)
                 {
                     string groupPrefix = GetGroupPreviewPrefix(costumeGroup.GroupName);
-                    OcclusionWeightGizmoDrawer.GetPreviewCountsForPrefix(groupPrefix, out int totalOcclusionPreviews, out int enabledOcclusionPreviews);
+                    OcclusionPreviewRenderer.GetPreviewCountsForPrefix(groupPrefix, out int totalOcclusionPreviews, out int enabledOcclusionPreviews);
                     bool hasOcclusionPreview = totalOcclusionPreviews > 0;
 
                     EditorGUILayout.BeginHorizontal();
@@ -299,12 +299,12 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     {
                         if (GUILayout.Button(enabledOcclusionPreviews > 0 ? "Hide O" : "Show O", GUILayout.Width(58)))
                         {
-                            OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix(groupPrefix, enabledOcclusionPreviews == 0);
+                            OcclusionPreviewRenderer.SetPreviewEnabledForPrefix(groupPrefix, enabledOcclusionPreviews == 0);
                         }
 
                         if (GUILayout.Button("Clr O", GUILayout.Width(50)))
                         {
-                            OcclusionWeightGizmoDrawer.RemovePreviewDataForPrefix(groupPrefix);
+                            OcclusionPreviewRenderer.RemovePreviewDataForPrefix(groupPrefix);
                         }
                     }
 
@@ -420,7 +420,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     openOcclusionPreviewSettingsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     previewOcclusionWeightsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
                     if (!enabled)
-                        OcclusionWeightGizmoDrawer.ClearPreviewData();
+                        OcclusionPreviewRenderer.ClearPreviewData();
                 });
 
                 openOcclusionPreviewSettingsButton.clicked += OcclusionPreviewSettingsWindow.ShowWindow;
@@ -1379,7 +1379,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 // Fibonacci sphere raycasting over the current NDMF preview/avatar state.
                 var weights = OcclusionVertexWeighter.ComputeWeights(
                     targetWorldMesh, colliderBuffer, colliderCount, Target.OcclusionWeightStrength);
-                OcclusionWeightGizmoDrawer.SetPreviewData(previewId, targetWorldMesh, weights, true);
+                OcclusionPreviewRenderer.SetPreviewData(previewId, targetWorldMesh, weights, true);
                 return true;
             }
             catch (Exception e)
@@ -1409,15 +1409,15 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 }
                 if (GUILayout.Button("Show All"))
                 {
-                    OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix("mesh::", true);
+                    OcclusionPreviewRenderer.SetPreviewEnabledForPrefix("mesh::", true);
                 }
                 if (GUILayout.Button("Hide All"))
                 {
-                    OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix("mesh::", false);
+                    OcclusionPreviewRenderer.SetPreviewEnabledForPrefix("mesh::", false);
                 }
                 if (GUILayout.Button("Clear All"))
                 {
-                    OcclusionWeightGizmoDrawer.ClearPreviewData();
+                    OcclusionPreviewRenderer.ClearPreviewData();
                 }
             }
 
@@ -1426,7 +1426,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 string groupName = costumeGroup.GroupName;
                 string groupPrefix = GetGroupPreviewPrefix(groupName);
 
-                OcclusionWeightGizmoDrawer.GetPreviewCountsForPrefix(groupPrefix, out int totalGroupPreviews, out int enabledGroupPreviews);
+                OcclusionPreviewRenderer.GetPreviewCountsForPrefix(groupPrefix, out int totalGroupPreviews, out int enabledGroupPreviews);
                 bool hasGroupPreview = totalGroupPreviews > 0;
 
                 using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
@@ -1446,11 +1446,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                         {
                             if (GUILayout.Button(enabledGroupPreviews > 0 ? "Hide Group" : "Show Group"))
                             {
-                                OcclusionWeightGizmoDrawer.SetPreviewEnabledForPrefix(groupPrefix, enabledGroupPreviews == 0);
+                                OcclusionPreviewRenderer.SetPreviewEnabledForPrefix(groupPrefix, enabledGroupPreviews == 0);
                             }
                             if (GUILayout.Button("Clear Group"))
                             {
-                                OcclusionWeightGizmoDrawer.RemovePreviewDataForPrefix(groupPrefix);
+                                OcclusionPreviewRenderer.RemovePreviewDataForPrefix(groupPrefix);
                             }
                         }
                     }
@@ -1458,8 +1458,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     foreach (var entry in EnumerateValidOcclusionEntries(groupName))
                     {
                         string previewId = GetMeshPreviewId(entry);
-                        bool hasPreview = OcclusionWeightGizmoDrawer.HasPreviewData(previewId);
-                        bool isEnabled = OcclusionWeightGizmoDrawer.IsPreviewEnabled(previewId);
+                        bool hasPreview = OcclusionPreviewRenderer.HasPreviewData(previewId);
+                        bool isEnabled = OcclusionPreviewRenderer.IsPreviewEnabled(previewId);
                         string rendererName = entry.GetTargetRenderer(Target)?.name ?? entry.RendererObjectReference.referencePath;
 
                         using (new EditorGUILayout.HorizontalScope())
@@ -1477,11 +1477,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                                 bool nextEnabled = EditorGUILayout.ToggleLeft("Show", isEnabled, GUILayout.Width(60));
                                 if (nextEnabled != isEnabled)
                                 {
-                                    OcclusionWeightGizmoDrawer.SetPreviewEnabled(previewId, nextEnabled);
+                                    OcclusionPreviewRenderer.SetPreviewEnabled(previewId, nextEnabled);
                                 }
                                 if (GUILayout.Button("Clear", GUILayout.Width(50)))
                                 {
-                                    OcclusionWeightGizmoDrawer.RemovePreviewData(previewId);
+                                    OcclusionPreviewRenderer.RemovePreviewData(previewId);
                                 }
                             }
                         }
@@ -1496,7 +1496,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 return;
 
             // Rebuild must reflect current state; clear old points for this mesh first.
-            OcclusionWeightGizmoDrawer.RemovePreviewData(GetMeshPreviewId(entry));
+            OcclusionPreviewRenderer.RemovePreviewData(GetMeshPreviewId(entry));
 
             if (!TryCreateOcclusionPreviewContext(out var context))
                 return;
@@ -1511,7 +1511,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 return;
 
             // Group rebuild should be a full rerun for that group.
-            OcclusionWeightGizmoDrawer.RemovePreviewDataForPrefix(GetGroupPreviewPrefix(costumeGroup));
+            OcclusionPreviewRenderer.RemovePreviewDataForPrefix(GetGroupPreviewPrefix(costumeGroup));
 
             if (!TryCreateOcclusionPreviewContext(out var context))
                 return;
@@ -1525,14 +1525,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         /// <summary>
         /// Computes per-vertex occlusion weights for all valid SkinnedMeshRenderer entries
-        /// and appends their sampled vertex previews to <see cref="OcclusionWeightGizmoDrawer"/>.
+        /// and appends their sampled vertex previews to <see cref="OcclusionPreviewRenderer"/>.
         /// </summary>
         private void ComputeAndPreviewOcclusionWeights()
         {
             var target = Target;
             if (!target.UseOcclusionWeightedSimplification) return;
 
-            OcclusionWeightGizmoDrawer.ClearPreviewData();
+            OcclusionPreviewRenderer.ClearPreviewData();
             if (!TryCreateOcclusionPreviewContext(out var context))
                 return;
 
