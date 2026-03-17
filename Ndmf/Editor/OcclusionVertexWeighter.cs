@@ -7,14 +7,19 @@ using UnityEngine;
 namespace Meshia.MeshSimplification.Ndmf.Editor
 {
     /// <summary>
-    /// Computes per-vertex occlusion weights using Fibonacci sphere raycasting against the
-    /// avatar's combined world-space geometry.
+    /// Computes per-vertex occlusion weights using outward-hemisphere visibility sampling against
+    /// the avatar's external clothing/body geometry.
     ///
-    /// For each vertex, rays are cast outward in evenly-distributed Fibonacci-lattice directions.
-    /// Directions that are blocked by occluder mesh colliders (geometry from other renderers on
-    /// the same avatar) count toward the occlusion score.  A self-collider with a minimum distance
-    /// guard also contributes, enabling per-mesh self-occlusion (e.g. body geometry hidden inside
-    /// clothing on a single SkinnedMeshRenderer).
+    /// For each vertex, rays are cast only in directions within the outward-facing hemisphere
+    /// (those where the ray direction aligns with the vertex normal).  Only external clothing
+    /// and body meshes act as occluders — there is no self-collider test, which previously caused
+    /// thin outer-surface meshes (e.g. stockings) to be falsely scored as occluded.
+    ///
+    /// This correctly answers: "From what fraction of external viewpoints is this vertex visible?"
+    /// Vertices on the outside of clothing (stockings, sleeves) have outward normals; their
+    /// outward rays escape freely → low score → preserved.  Body vertices buried under clothing
+    /// have their outward rays immediately blocked by the clothing collider → high score →
+    /// simplified aggressively.
     ///
     /// After scoring, a triangle-connectivity-based smoothing pass is applied to produce
     /// smooth weight gradients across the mesh surface.
@@ -27,14 +32,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         // Ray origin offset to step slightly above the surface and avoid self-intersection.
         private const float RayOriginBias = 0.001f;
 
-        // A self-collider hit only counts as occlusion when it is further away than this
-        // distance, preventing the vertex's own adjacent faces from registering as blockers.
-        // 1cm avoids noise from neighbouring triangles on the same mesh.
-        private const float SelfMinHitDist = 0.01f;
-
-        // Default number of Fibonacci sphere sample directions.
-        // 64 directions gives ~1.6% resolution per step which is smooth enough for
-        // visible heatmaps while keeping computation time reasonable.
+        // Default number of Fibonacci sphere candidate directions.
+        // At runtime only the outward-hemisphere subset (~half) is actually tested.
+        // 64 candidates gives adequate hemisphere coverage while keeping computation reasonable.
         private const int DefaultRayCount = 64;
 
         // Default maximum ray distance for occlusion tests (0.5 m – avatar scale).
@@ -44,6 +44,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         // Number of Laplacian smoothing iterations applied to raw scores.
         private const int SmoothIterations = 3;
 
+        // Minimum squared magnitude for a vertex normal to be considered valid.
+        // Below this threshold the normal is treated as zero-length and the hemisphere
+        // gate is skipped (full sphere used instead).
+        private const float MinNormalMagnitudeSq = 1e-6f;
+
         // Cached Fibonacci directions for the default ray count (immutable, safe for sharing).
         private static Vector3[]? s_cachedDirs;
 
@@ -52,15 +57,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         // ──────────────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Computes per-vertex simplification weights using Fibonacci sphere raycasting.
+        /// Computes per-vertex simplification weights using outward-hemisphere visibility sampling.
         /// </summary>
         /// <param name="worldSpaceMesh">
         ///   Mesh with vertices already in world space (baked or statically-transformed).
-        ///   Also used internally to build a self-occlusion collider for this mesh.
         /// </param>
         /// <param name="externalOccluderColliders">
         ///   World-space <see cref="MeshCollider"/> objects for all OTHER meshes on the avatar
-        ///   (the target renderer itself must be excluded so the self-collider path handles it).
+        ///   (external clothing and body geometry).  The target renderer itself must be excluded.
         /// </param>
         /// <param name="externalOccluderCount">
         ///   Number of valid entries in <paramref name="externalOccluderColliders"/>.
@@ -109,8 +113,6 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
             var directions = GetFibonacciDirections(rayCount);
 
-            using var selfOccluder = SelfMeshRayOccluder.Create(worldSpaceMesh);
-
             for (int i = 0; i < vertexCount; i++)
             {
                 Vector3 normal = i < normals.Length ? normals[i] : Vector3.zero;
@@ -118,7 +120,6 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     vertices[i], normal,
                     directions,
                     externalOccluderColliders, clampedCount,
-                    selfOccluder.Collider,
                     maxRayDistance);
             }
 
@@ -138,34 +139,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         }
 
         // ──────────────────────────────────────────────────────────────────────────────
-        //  Temporary self-collider helper
-        // ──────────────────────────────────────────────────────────────────────────────
-
-        private sealed class SelfMeshRayOccluder : System.IDisposable
-        {
-            private readonly GameObject _go;
-            public MeshCollider Collider { get; }
-
-            private SelfMeshRayOccluder(GameObject go, MeshCollider col) { _go = go; Collider = col; }
-
-            public static SelfMeshRayOccluder Create(Mesh worldSpaceMesh)
-            {
-                var go = new GameObject("MeshiaOcclusionSelfRay") { hideFlags = HideFlags.HideAndDontSave };
-                go.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
-                go.transform.localScale = Vector3.one;
-                var col = go.AddComponent<MeshCollider>();
-                col.sharedMesh = worldSpaceMesh;
-                return new SelfMeshRayOccluder(go, col);
-            }
-
-            public void Dispose()
-            {
-                if (_go != null) Object.DestroyImmediate(_go);
-            }
-        }
-
-        // ──────────────────────────────────────────────────────────────────────────────
-        //  Core per-vertex Fibonacci sphere scoring
+        //  Core per-vertex outward-hemisphere visibility scoring
         // ──────────────────────────────────────────────────────────────────────────────
 
         /// <summary>Returns [0, 1]: 0 = fully visible, 1 = fully occluded.</summary>
@@ -175,29 +149,43 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             Vector3[] fibDirs,
             MeshCollider[] externalColliders,
             int externalCount,
-            MeshCollider selfCollider,
             float maxDist)
         {
             if (externalCount == 0)
                 return 0f;
 
+            // Determine whether we have a valid surface normal.
+            // If the normal is zero-length (degenerate vertex), fall back to the full sphere
+            // so degenerate vertices are treated conservatively.
+            bool hasNormal = normal.sqrMagnitude > MinNormalMagnitudeSq;
+            Vector3 n = hasNormal ? normal.normalized : Vector3.zero;
+
             // Bias the ray origin slightly above the surface along the vertex normal
             // to prevent rays from immediately intersecting the vertex's own face.
-            Vector3 origin = normal.sqrMagnitude > 1e-6f
-                ? vertex + normal.normalized * RayOriginBias
+            Vector3 origin = hasNormal
+                ? vertex + n * RayOriginBias
                 : vertex;
 
             int blocked = 0;
-            int total = fibDirs.Length;
+            int tested = 0;
 
-            for (int d = 0; d < total; d++)
+            for (int d = 0; d < fibDirs.Length; d++)
             {
+                // Only test directions in the outward hemisphere (facing away from the surface).
+                // Directions pointing into the body are irrelevant for external visibility and
+                // cause false-positive occlusion on thin outer-surface meshes (e.g. stockings):
+                // those inward rays immediately hit the body mesh underneath.
+                // When no valid normal exists, skip the hemisphere gate and test all directions.
+                if (hasNormal && Vector3.Dot(fibDirs[d], n) <= 0f)
+                    continue;
+
+                tested++;
                 var ray = new Ray(origin, fibDirs[d]);
                 bool hit = false;
 
-                // 1. Test all external (other-renderer) occluder colliders.
-                //    Any hit within maxDist counts – no minimum distance required here
-                //    because these are entirely separate meshes.
+                // Test external (clothing/other-renderer) occluder colliders only.
+                // No self-collider test: the self-collider caused false positives on thin
+                // clothing surfaces by counting hits on the far side of the same mesh as occlusion.
                 for (int c = 0; c < externalCount; c++)
                 {
                     if (externalColliders[c] != null &&
@@ -208,22 +196,12 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     }
                 }
 
-                // 2. Test against the self-collider (same mesh as the vertex).
-                //    Only count as an occluder when the hit is at least SelfMinHitDist away,
-                //    which filters out the vertex's own adjacent triangles.
-                if (!hit && selfCollider != null)
-                {
-                    if (selfCollider.Raycast(ray, out var selfHit, maxDist) &&
-                        selfHit.distance >= SelfMinHitDist)
-                    {
-                        hit = true;
-                    }
-                }
-
                 if (hit) blocked++;
             }
 
-            return blocked / (float)total;
+            // Denominator is only the outward-hemisphere directions actually tested,
+            // making the score independent of the normal orientation.
+            return tested > 0 ? blocked / (float)tested : 0f;
         }
 
         // ──────────────────────────────────────────────────────────────────────────────
