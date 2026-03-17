@@ -218,8 +218,8 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                             verts[i] = l2w.MultiplyPoint3x4(verts[i]);
                         worldMesh.vertices = verts;
 
-                        if (!baked)
-                            worldMesh.RecalculateBounds();
+                        // Always recalculate bounds after world-space transform.
+                        worldMesh.RecalculateBounds();
 
                         var go = new GameObject("MeshiaOccluder") { hideFlags = HideFlags.HideAndDontSave };
                         var col = go.AddComponent<MeshCollider>();

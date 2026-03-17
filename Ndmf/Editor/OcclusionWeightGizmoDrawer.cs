@@ -10,9 +10,10 @@ using UnityEngine.Rendering;
 namespace Meshia.MeshSimplification.Ndmf.Editor
 {
     /// <summary>
-    /// Draws a sampled per-vertex occlusion weight heatmap in the Scene View.
+    /// Draws a per-vertex occlusion weight heatmap over the mesh surface in the Scene View.
+    /// Renders actual mesh triangles (GL.TRIANGLES) with per-vertex interpolated colors.
     /// Green = weight 1.0 (visible, preserved), Red = weight 10.0 (occluded, simplified aggressively).
-    /// Uses pre-baked sampled arrays for responsiveness; no per-frame mesh traversal.
+    /// Uses pre-baked triangle arrays for responsiveness; no per-frame mesh traversal.
     /// </summary>
     [InitializeOnLoad]
     internal static class OcclusionWeightGizmoDrawer
@@ -24,9 +25,11 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         private const string LegacyPrefKeyMaxTrianglesTotal = "Meshia.Occlusion.MaxTrianglesTotal";
         private const int PrefDefaultMaxVerticesPerMesh = 20000;
         private const int PrefDefaultMaxVerticesTotal = 80000;
-        private const float MarkerSize = 0.0025f;
         private const float ContrastGamma = 0.55f;
         private const string DefaultPreviewId = "default";
+
+        // Small offset along face normal to prevent z-fighting with the actual mesh surface.
+        private const float NormalOffset = 0.0005f;
 
         private static int MaxVerticesPerMesh =>
             GetIntWithLegacyFallback(PrefKeyMaxVerticesPerMesh, LegacyPrefKeyMaxTrianglesPerMesh, PrefDefaultMaxVerticesPerMesh);
@@ -196,41 +199,69 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         private static void BuildDrawArraysForMesh(Mesh mesh, float[] weights, out Vector3[]? outPositions, out Color[]? outColors)
         {
             var meshVertices = mesh.vertices;
+            var meshTriangles = mesh.triangles;
             int vertexCount = meshVertices.Length;
-            if (vertexCount == 0)
+            int triangleCount = meshTriangles.Length / 3;
+
+            if (vertexCount == 0 || triangleCount == 0)
             {
                 outPositions = Array.Empty<Vector3>();
                 outColors = Array.Empty<Color>();
                 return;
             }
 
-            int vertexLimit = Mathf.Min(vertexCount, MaxVerticesPerMesh);
-            if (vertexLimit <= 0)
+            // Budget: MaxVerticesPerMesh is the triangle-vertex budget (each triangle = 3 vertices).
+            int maxTriVerts = Mathf.Max(3, MaxVerticesPerMesh);
+            int maxTris = maxTriVerts / 3;
+
+            // Sample every Nth triangle if over budget.
+            int stride = triangleCount > maxTris ? (triangleCount + maxTris - 1) / maxTris : 1;
+            int sampledTriCount = Mathf.Min((triangleCount + stride - 1) / stride, maxTris);
+
+            var positions = new Vector3[sampledTriCount * 3];
+            var colors = new Color[sampledTriCount * 3];
+
+            int outIdx = 0;
+            for (int t = 0; t < triangleCount && outIdx + 2 < positions.Length; t += stride)
             {
-                outPositions = Array.Empty<Vector3>();
-                outColors = Array.Empty<Color>();
-                return;
+                int baseIdx = t * 3;
+                int i0 = meshTriangles[baseIdx];
+                int i1 = meshTriangles[baseIdx + 1];
+                int i2 = meshTriangles[baseIdx + 2];
+
+                if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount)
+                    continue;
+
+                Vector3 v0 = meshVertices[i0];
+                Vector3 v1 = meshVertices[i1];
+                Vector3 v2 = meshVertices[i2];
+
+                // Slight offset along face normal to prevent z-fighting with the actual mesh.
+                Vector3 faceNormal = Vector3.Cross(v1 - v0, v2 - v0);
+                float areaSq = faceNormal.sqrMagnitude;
+                if (areaSq > 1e-12f)
+                    faceNormal = faceNormal * (NormalOffset / Mathf.Sqrt(areaSq));
+                else
+                    faceNormal = Vector3.zero;
+
+                positions[outIdx] = v0 + faceNormal;
+                colors[outIdx] = WeightToColor(i0 < weights.Length ? weights[i0] : 1f);
+                outIdx++;
+
+                positions[outIdx] = v1 + faceNormal;
+                colors[outIdx] = WeightToColor(i1 < weights.Length ? weights[i1] : 1f);
+                outIdx++;
+
+                positions[outIdx] = v2 + faceNormal;
+                colors[outIdx] = WeightToColor(i2 < weights.Length ? weights[i2] : 1f);
+                outIdx++;
             }
 
-            var positions = new Vector3[vertexLimit];
-            var colors = new Color[vertexLimit];
-
-            // Integer stride: sample every Nth vertex (N = vertexCount / vertexLimit, rounded up)
-            int stride = vertexCount > vertexLimit ? (vertexCount + vertexLimit - 1) / vertexLimit : 1;
-            int outputVertex = 0;
-
-            for (int v = 0; v < vertexCount && outputVertex < vertexLimit; v += stride)
+            // Trim to actual size if fewer triangles were emitted (due to degenerate/skipped tris).
+            if (outIdx < positions.Length)
             {
-                positions[outputVertex] = meshVertices[v];
-                colors[outputVertex] = WeightToColor(v < weights.Length ? weights[v] : 1f);
-                outputVertex++;
-            }
-
-            // Trim to actual size if fewer vertices were sampled
-            if (outputVertex < vertexLimit)
-            {
-                Array.Resize(ref positions, outputVertex);
-                Array.Resize(ref colors, outputVertex);
+                Array.Resize(ref positions, outIdx);
+                Array.Resize(ref colors, outIdx);
             }
 
             outPositions = positions;
@@ -249,7 +280,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 "GreenRed" => Color.Lerp(Color.green, Color.red, t),
                 _ => Viridis(t),
             };
-            c.a = 0.95f;
+            c.a = 0.85f;
             return c;
         }
 
@@ -264,18 +295,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             mat.SetPass(0);
             GL.PushMatrix();
             GL.MultMatrix(Matrix4x4.identity);
-            GL.Begin(GL.LINES);
-
-            var sceneCamera = sceneView.camera;
-            if (sceneCamera == null)
-            {
-                GL.End();
-                GL.PopMatrix();
-                return;
-            }
-
-            Vector3 right = sceneCamera.transform.right;
-            Vector3 up = sceneCamera.transform.up;
+            GL.Begin(GL.TRIANGLES);
 
             int drawnVertices = 0;
             int maxVertices = MaxVerticesTotal;
@@ -291,20 +311,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 int remaining = maxVertices - drawnVertices;
                 if (remaining <= 0) break;
 
+                // Ensure we draw complete triangles (multiple of 3).
                 int drawCount = Mathf.Min(remaining, positions.Length);
+                drawCount = (drawCount / 3) * 3;
 
                 for (int i = 0; i < drawCount; i++)
                 {
-                    float markerScale = MarkerSize;
-                    Vector3 offsetRight = right * markerScale;
-                    Vector3 offsetUp = up * markerScale;
-
                     GL.Color(colors[i]);
-                    // Draw a small cross to mark a single sampled vertex clearly from multiple view angles.
-                    GL.Vertex(positions[i] - offsetRight);
-                    GL.Vertex(positions[i] + offsetRight);
-                    GL.Vertex(positions[i] - offsetUp);
-                    GL.Vertex(positions[i] + offsetUp);
+                    GL.Vertex3(positions[i].x, positions[i].y, positions[i].z);
                 }
 
                 drawnVertices += drawCount;
@@ -329,7 +343,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             _glMaterial.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
             _glMaterial.SetInt("_Cull", (int)CullMode.Off);
             _glMaterial.SetInt("_ZWrite", 0);
-            _glMaterial.SetInt("_ZTest", (int)CompareFunction.Always);
+            _glMaterial.SetInt("_ZTest", (int)CompareFunction.LessEqual);
             return _glMaterial;
         }
 

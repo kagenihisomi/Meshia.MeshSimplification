@@ -1182,18 +1182,19 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 worldMesh.normals = normals;
             }
 
-            if (!baked)
-                worldMesh.RecalculateBounds();
+            // Always recalculate bounds after transforming vertices to world space.
+            // The baked path had bounds in local space; without this, MeshCollider
+            // and other consumers see stale bounds.
+            worldMesh.RecalculateBounds();
 
             return true;
         }
 
         /// <summary>
-        /// Holds per-renderer world-space MeshCollider objects baked from the ORIGINAL avatar
-        /// renderers (not NDMF preview proxies).  Using original renderers ensures vertex positions
-        /// are derived from correctly-rigged SkinnedMeshRenderers rather than the proxy stubs
-        /// whose bone transforms may not be fully initialised, which would otherwise scatter
-        /// occlusion-preview dots off the visible mesh surface.
+        /// Holds per-renderer world-space MeshCollider objects for occlusion raycasting.
+        /// Includes ALL renderers with valid mesh data on the avatar — even those disabled
+        /// by NDMF preview — so clothing always participates as occluders for the body mesh.
+        /// Deduplicates by resolved source renderer to avoid self-occlusion from proxy/original pairs.
         /// </summary>
         private sealed class OcclusionPreviewContext : IDisposable
         {
@@ -1215,12 +1216,35 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             public static OcclusionPreviewContext Build(Renderer[] originalRenderers)
             {
                 var list = new List<ColEntry>(originalRenderers.Length);
+                // Track resolved source renderers to prevent duplicate colliders when
+                // both an original and its NDMF preview proxy appear in the input list.
+                var usedSources = new HashSet<Renderer>();
+
                 foreach (var originalRenderer in originalRenderers)
                 {
                     if (originalRenderer == null)
                         continue;
 
-                    if (!TryResolveOcclusionPreviewSourceRenderer(originalRenderer, out var sourceRenderer, out var sourceKind))
+                    Renderer sourceRenderer;
+                    OcclusionRenderStateSource sourceKind;
+
+                    if (!TryResolveOcclusionPreviewSourceRenderer(originalRenderer, out sourceRenderer, out sourceKind))
+                    {
+                        // Renderer might be disabled by NDMF preview (originals are hidden
+                        // when proxies take over).  Still include it as an occluder if it
+                        // has valid mesh data — this is critical for clothing to participate
+                        // as occluders when computing body mesh occlusion.
+                        var mesh = RendererUtility.GetMesh(originalRenderer);
+                        if (mesh == null || mesh.vertexCount == 0)
+                            continue;
+                        sourceRenderer = originalRenderer;
+                        sourceKind = OcclusionRenderStateSource.OriginalAvatar;
+                    }
+
+                    // Deduplicate: skip if we've already built a collider from this exact
+                    // source renderer (happens when both original + proxy resolve to the
+                    // same underlying renderer).
+                    if (!usedSources.Add(sourceRenderer))
                         continue;
 
                     if (!TryBuildWorldSpaceMeshFromRenderer(sourceRenderer, sourceKind, out var worldMesh))
@@ -1243,15 +1267,35 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
 
             /// <summary>
-            /// Fills <paramref name="buffer"/> with every collider except the one for
+            /// Fills <paramref name="buffer"/> with every collider except those belonging to
             /// <paramref name="originalRenderer"/> and returns the count via <paramref name="count"/>.
+            /// Also excludes entries that share the same source renderer to prevent self-occlusion
+            /// from proxy/original pairs.
             /// </summary>
             public void GetExternalColliders(Renderer originalRenderer, MeshCollider[] buffer, out int count)
             {
+                // Find the source renderer for the target so we can also exclude its proxy/duplicate.
+                Renderer? targetSource = null;
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, originalRenderer))
+                    {
+                        targetSource = e.Source;
+                        break;
+                    }
+                }
+
                 count = 0;
                 foreach (var e in _entries)
-                    if (!ReferenceEquals(e.Original, originalRenderer))
-                        buffer[count++] = e.Collider;
+                {
+                    if (ReferenceEquals(e.Original, originalRenderer))
+                        continue;
+                    // Exclude entries that share the same source (prevents self-occlusion
+                    // when both original and proxy are in the context).
+                    if (targetSource != null && ReferenceEquals(e.Source, targetSource))
+                        continue;
+                    buffer[count++] = e.Collider;
+                }
             }
 
             public void Dispose()
