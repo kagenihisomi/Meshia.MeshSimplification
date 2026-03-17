@@ -196,6 +196,93 @@ namespace Meshia.MeshSimplification
 
 
         }
+
+        /// <summary>
+        /// Simplifies multiple meshes in batch, optionally applying per-vertex occlusion weights to each mesh.
+        /// When <paramref name="parameters"/> includes non-null <c>VertexOcclusionWeights</c>, occluded vertices
+        /// will be simplified more aggressively than visible ones within the same mesh.
+        /// </summary>
+        public static void SimplifyBatch(IReadOnlyList<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, BitArray? PreserveBorderEdgesBoneIndices, float[]? VertexOcclusionWeights, Mesh Destination)> parameters)
+        {
+            Allocator allocator = Unity.Collections.Allocator.TempJob;
+
+            using (ListPool<Mesh>.Get(out var meshes))
+            using (ListPool<Mesh>.Get(out var destinations))
+            {
+                Span<NativeList<BlendShapeData>> blendShapesList = stackalloc NativeList<BlendShapeData>[parameters.Count];
+                Span<NativeList<BlendShapeData>> simplifiedBlendShapesList = stackalloc NativeList<BlendShapeData>[parameters.Count];
+                Span<MeshSimplifier> meshSimplifiers = stackalloc MeshSimplifier[parameters.Count];
+                Span<JobHandle> jobHandles = stackalloc JobHandle[parameters.Count];
+                foreach (var parameter in parameters)
+                {
+                    meshes.Add(parameter.Mesh);
+                    destinations.Add(parameter.Destination);
+                }
+
+                var originalMeshDataArray = Mesh.AcquireReadOnlyMeshData(meshes);
+                var simplifiedMeshDataArray = Mesh.AllocateWritableMeshData(originalMeshDataArray.Length);
+
+                for (int i = 0; i < parameters.Count; i++)
+                {
+                    var (mesh, target, options, preserveBorderEdgesBoneIndices, vertexOcclusionWeights, destination) = parameters[i];
+                    var originalMeshData = originalMeshDataArray[i];
+                    var blendShapes = BlendShapeData.GetMeshBlendShapes(mesh, allocator);
+                    blendShapesList[i] = blendShapes;
+                    var meshSimplifier = new MeshSimplifier(allocator);
+                    meshSimplifiers[i] = meshSimplifier;
+                    NativeBitArray nativePreserveBorderEdgesBoneIndices = new(preserveBorderEdgesBoneIndices?.Length ?? 0, allocator, NativeArrayOptions.UninitializedMemory);
+                    if (preserveBorderEdgesBoneIndices is not null)
+                    {
+                        for (int boneIndex = 0; boneIndex < preserveBorderEdgesBoneIndices.Length; boneIndex++)
+                        {
+                            nativePreserveBorderEdgesBoneIndices.Set(boneIndex, preserveBorderEdgesBoneIndices[boneIndex]);
+                        }
+                    }
+                    NativeList<BlendShapeData> simplifiedBlendShapes = new(allocator);
+                    simplifiedBlendShapesList[i] = simplifiedBlendShapes;
+
+                    // Use the overload of ScheduleLoadMeshData that applies weights before computing
+                    // initial vertex merge costs, so the full simplification pipeline is weight-aware.
+                    JobHandle load;
+                    if (vertexOcclusionWeights != null && vertexOcclusionWeights.Length > 0)
+                    {
+                        var nativeWeights = new NativeArray<float>(vertexOcclusionWeights, allocator);
+                        load = meshSimplifier.ScheduleLoadMeshData(originalMeshData, options, nativePreserveBorderEdgesBoneIndices, nativeWeights);
+                        nativeWeights.Dispose(load);
+                    }
+                    else
+                    {
+                        load = meshSimplifier.ScheduleLoadMeshData(originalMeshData, options, nativePreserveBorderEdgesBoneIndices);
+                    }
+
+                    var simplify = meshSimplifier.ScheduleSimplify(originalMeshData, blendShapes, target, nativePreserveBorderEdgesBoneIndices, load);
+                    nativePreserveBorderEdgesBoneIndices.Dispose(simplify);
+                    var write = meshSimplifier.ScheduleWriteMeshData(originalMeshData, blendShapes, simplifiedMeshDataArray[i], simplifiedBlendShapes, simplify);
+                    meshSimplifier.Dispose(write);
+                    jobHandles[i] = write;
+                }
+                JobHandle.ScheduleBatchedJobs();
+                jobHandles.CombineDependencies().Complete();
+                originalMeshDataArray.Dispose();
+                foreach (var blendShapes in blendShapesList)
+                {
+                    foreach (var blendShape in blendShapes)
+                    {
+                        blendShape.Dispose();
+                    }
+                    blendShapes.Dispose();
+                }
+                ApplySimplifiedMeshes(meshes, simplifiedMeshDataArray, simplifiedBlendShapesList, destinations);
+                foreach (var simplifiedBlendShapes in simplifiedBlendShapesList)
+                {
+                    foreach (var simplifiedBlendShape in simplifiedBlendShapes)
+                    {
+                        simplifiedBlendShape.Dispose();
+                    }
+                    simplifiedBlendShapes.Dispose();
+                }
+            }
+        }
         /// <summary>
         /// Asynchronously simplifies the given <paramref name="mesh"/> and writes the result to <paramref name="destination"/>.
         /// </summary>
@@ -405,6 +492,30 @@ namespace Meshia.MeshSimplification
          /// <returns>The handle of a new job that will load mesh data from the <paramref name="meshData"/> into this <see cref="MeshSimplifier"/>.</returns>
         public JobHandle ScheduleLoadMeshData(Mesh.MeshData meshData, MeshSimplifierOptions options, NativeBitArray preserveBorderEdgesBoneIndices, JobHandle dependency = default)
         {
+            return ScheduleLoadMeshDataCore(meshData, options, preserveBorderEdgesBoneIndices, default, dependency);
+        }
+
+        /// <summary>
+        /// Creates and schedules jobs that load mesh data and apply per-vertex occlusion weights before computing
+        /// the initial vertex merge costs. This ensures that both the initial and recomputed merge costs reflect
+        /// the occlusion weights, enabling full occlusion-weighted simplification within a single mesh.
+        /// </summary>
+        /// <param name="meshData">The mesh data to load.</param>
+        /// <param name="options">The options for this mesh simplification.</param>
+        /// <param name="preserveBorderEdgesBoneIndices">Bone indices whose border edges should be preserved.</param>
+        /// <param name="vertexSimplificationWeights">
+        /// Per-vertex simplification weights (length = vertex count).
+        /// 1.0 = preserve (visible), higher values = simplify more aggressively (occluded).
+        /// Pass a default/uninitialized NativeArray to skip weighting.
+        /// </param>
+        /// <param name="dependency">The handle of a job which the new job will depend upon.</param>
+        public JobHandle ScheduleLoadMeshData(Mesh.MeshData meshData, MeshSimplifierOptions options, NativeBitArray preserveBorderEdgesBoneIndices, NativeArray<float> vertexSimplificationWeights, JobHandle dependency = default)
+        {
+            return ScheduleLoadMeshDataCore(meshData, options, preserveBorderEdgesBoneIndices, vertexSimplificationWeights, dependency);
+        }
+
+        private JobHandle ScheduleLoadMeshDataCore(Mesh.MeshData meshData, MeshSimplifierOptions options, NativeBitArray preserveBorderEdgesBoneIndices, NativeArray<float> vertexSimplificationWeights, JobHandle dependency)
+        {
             Options = options;
             var constructVertexPositionBuffer = ScheduleCopyVertexPositionBuffer(meshData, dependency);
             var constructVertexNormalBuffer = ScheduleCopyVertexAttributeBufferAsFloat4(meshData, VertexAttribute.Normal, dependency);
@@ -481,7 +592,19 @@ namespace Meshia.MeshSimplification
 
             triangleErrorQuadrics.Dispose(constructVertexErrorQuadrics);
 
-            var constructVertexMerges = ScheduleInitializeVertexMerges(mergePairs, preserveBorderEdgesBoneIndices, constructVertexPositionBuffer, constructVertexBlendIndicesBuffer, constructVertexErrorQuadrics, constructTriangleNormalsAndErrorQuadrics, constructVertexContainingTrianglesAndTriangleDiscardedBits, constructVertexIsBorderEdgeBits, constructMergePairs);
+            // Apply per-vertex occlusion weights to error quadrics BEFORE computing initial vertex merges.
+            // This ensures that initial merge costs reflect the weights, so occluded vertices are simplified first.
+            var constructWeightedVertexErrorQuadrics = constructVertexErrorQuadrics;
+            if (vertexSimplificationWeights.IsCreated && vertexSimplificationWeights.Length > 0)
+            {
+                constructWeightedVertexErrorQuadrics = new ScaleVertexErrorQuadricsJob
+                {
+                    VertexSimplificationWeights = vertexSimplificationWeights,
+                    VertexErrorQuadrics = VertexErrorQuadrics.AsDeferredJobArray(),
+                }.Schedule(VertexErrorQuadrics, Unity.Jobs.LowLevel.Unsafe.JobsUtility.CacheLineSize, constructVertexErrorQuadrics);
+            }
+
+            var constructVertexMerges = ScheduleInitializeVertexMerges(mergePairs, preserveBorderEdgesBoneIndices, constructVertexPositionBuffer, constructVertexBlendIndicesBuffer, constructWeightedVertexErrorQuadrics, constructTriangleNormalsAndErrorQuadrics, constructVertexContainingTrianglesAndTriangleDiscardedBits, constructVertexIsBorderEdgeBits, constructMergePairs);
 
             mergePairs.Dispose(constructVertexMerges);
 
@@ -512,7 +635,7 @@ namespace Meshia.MeshSimplification
 
                 initializeVertexVersions,
 
-                constructVertexErrorQuadrics,
+                constructWeightedVertexErrorQuadrics,
 
                 constructTriangles,
                 constructTriangleNormalsAndErrorQuadrics,
@@ -597,6 +720,29 @@ namespace Meshia.MeshSimplification
             }.Schedule(dependency);
         }
 
+
+        /// <summary>
+        /// Creates and schedules a job that scales each vertex's error quadric by the inverse of its
+        /// simplification weight. This causes high-weight (occluded) vertices to be cheaper to merge
+        /// and therefore simplified more aggressively than low-weight (visible) vertices.
+        /// </summary>
+        /// <param name="vertexSimplificationWeights">
+        /// Per-vertex simplification weights. Length must equal the number of vertices in the mesh.
+        /// Values ≥ 1.0: 1.0 = preserve (visible), higher = simplify more aggressively (occluded).
+        /// </param>
+        /// <param name="dependency">The handle of a job which the new job will depend upon. Must include the handle from <see cref="ScheduleLoadMeshData(Mesh.MeshData, MeshSimplifierOptions, JobHandle)"/>.</param>
+        /// <returns>The handle of the new job. Pass this as the dependency to <see cref="ScheduleSimplify(Mesh.MeshData, NativeList{BlendShapeData}, MeshSimplificationTarget, NativeBitArray, JobHandle)"/>.</returns>
+        public JobHandle ScheduleApplyVertexOcclusionWeights(NativeArray<float> vertexSimplificationWeights, JobHandle dependency)
+        {
+            if (!vertexSimplificationWeights.IsCreated || vertexSimplificationWeights.Length == 0)
+                return dependency;
+
+            return new ScaleVertexErrorQuadricsJob
+            {
+                VertexSimplificationWeights = vertexSimplificationWeights,
+                VertexErrorQuadrics = VertexErrorQuadrics.AsDeferredJobArray(),
+            }.Schedule(VertexErrorQuadrics, Unity.Jobs.LowLevel.Unsafe.JobsUtility.CacheLineSize, dependency);
+        }
 
         /// <summary>
         /// Creates and schedules a job that will simplify the mesh data..

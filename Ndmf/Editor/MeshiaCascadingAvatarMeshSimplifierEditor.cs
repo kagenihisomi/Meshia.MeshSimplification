@@ -201,6 +201,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                 foreach (var costumeGroup in target.CostumeGroups)
                 {
+                    string groupPrefix = GetGroupPreviewPrefix(costumeGroup.GroupName);
+                    OcclusionPreviewRenderer.GetPreviewCountsForPrefix(groupPrefix, out int totalOcclusionPreviews, out int enabledOcclusionPreviews);
+                    bool hasOcclusionPreview = totalOcclusionPreviews > 0;
+
                     EditorGUILayout.BeginHorizontal();
                     EditorGUILayout.LabelField(costumeGroup.GroupName, GUILayout.Width(130));
 
@@ -283,6 +287,27 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                         RefreshEntriesListView(entriesListView);
                     }
 
+                    using (new EditorGUI.DisabledScope(!Target.UseOcclusionWeightedSimplification))
+                    {
+                        if (GUILayout.Button("Occl", GUILayout.Width(42)))
+                        {
+                            ComputeAndPreviewOcclusionWeights(costumeGroup.GroupName);
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(!Target.UseOcclusionWeightedSimplification || !hasOcclusionPreview))
+                    {
+                        if (GUILayout.Button(enabledOcclusionPreviews > 0 ? "Hide O" : "Show O", GUILayout.Width(58)))
+                        {
+                            OcclusionPreviewRenderer.SetPreviewEnabledForPrefix(groupPrefix, enabledOcclusionPreviews == 0);
+                        }
+
+                        if (GUILayout.Button("Clr O", GUILayout.Width(50)))
+                        {
+                            OcclusionPreviewRenderer.RemovePreviewDataForPrefix(groupPrefix);
+                        }
+                    }
+
                     EditorGUI.BeginChangeCheck();
                     var newValue = EditorGUILayout.IntField(costumeGroup.TargetTriangleCount, GUILayout.Width(70));
                     if (EditorGUI.EndChangeCheck())
@@ -298,7 +323,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                     var current = currentByGroup.TryGetValue(costumeGroup.GroupName, out var cc) ? cc : 0;
                     var max = maxByGroup.TryGetValue(costumeGroup.GroupName, out var mm) ? mm : 0;
-                    EditorGUILayout.LabelField($"({current}/{max})", GUILayout.Width(100));
+                    EditorGUILayout.LabelField($"({current}/{max}) O:{enabledOcclusionPreviews}/{totalOcclusionPreviews}", GUILayout.Width(145));
 
                     EditorGUILayout.EndHorizontal();
                 }
@@ -374,6 +399,39 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                 }
             });
 
+            // --- Occlusion-Weighted Simplification UI ---
+            var occlusionWeightedToggle = root.Q<Toggle>("OcclusionWeightedToggle");
+            var occlusionWeightStrengthSlider = root.Q<Slider>("OcclusionWeightStrengthSlider");
+            var openOcclusionPreviewSettingsButton = root.Q<Button>("OpenOcclusionPreviewSettingsButton");
+            var previewOcclusionWeightsButton = root.Q<Button>("PreviewOcclusionWeightsButton");
+            var occlusionLegendHelpBox = root.Q<HelpBox>("OcclusionLegendHelpBox");
+
+            if (occlusionWeightedToggle != null && occlusionWeightStrengthSlider != null && previewOcclusionWeightsButton != null && openOcclusionPreviewSettingsButton != null)
+            {
+                // Set initial visibility based on current serialized value
+                bool initialOcclusionEnabled = Target.UseOcclusionWeightedSimplification;
+                occlusionWeightStrengthSlider.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                openOcclusionPreviewSettingsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                previewOcclusionWeightsButton.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+                if (occlusionLegendHelpBox != null)
+                    occlusionLegendHelpBox.style.display = initialOcclusionEnabled ? DisplayStyle.Flex : DisplayStyle.None;
+
+                occlusionWeightedToggle.RegisterValueChangedCallback(evt =>
+                {
+                    bool enabled = evt.newValue;
+                    occlusionWeightStrengthSlider.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    openOcclusionPreviewSettingsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    previewOcclusionWeightsButton.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    if (occlusionLegendHelpBox != null)
+                        occlusionLegendHelpBox.style.display = enabled ? DisplayStyle.Flex : DisplayStyle.None;
+                    if (!enabled)
+                        OcclusionPreviewRenderer.ClearPreviewData();
+                });
+
+                openOcclusionPreviewSettingsButton.clicked += OcclusionPreviewSettingsWindow.ShowWindow;
+                previewOcclusionWeightsButton.clicked += () => ComputeAndPreviewOcclusionWeights();
+            }
+
 
             triangleCountLabel.onGUIHandler = () =>
             {
@@ -444,24 +502,33 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             };
             resetButton.clicked += () =>
             {
-                var originalTriangleCount = GetTotalOriginalTriangleCount();
+                var target = Target;
+                Undo.RecordObject(target, "Reset Meshia Cascading Avatar Mesh Simplifier");
 
-                var quality = originalTriangleCount > 0 ? TargetTriangleCountProperty.intValue / (float)originalTriangleCount : 1f;
+                // Clear all serialized lists and reset configuration to defaults
+                target.Entries.Clear();
+                target.CostumeGroups.Clear();
 
-                var entriesProperty = EntriesProperty;
-                var arraySize = entriesProperty.arraySize;
-                for (int i = 0; i < arraySize; i++)
+                target.TargetTriangleCount = 70000;
+                target.AutoAdjustEnabled = true;
+                target.MinimumTriangleThreshold = 500;
+                target.UseOcclusionWeightedSimplification = false;
+                target.OcclusionWeightStrength = 0.7f;
+
+                // Rebuild entries from the current avatar hierarchy
+                try
                 {
-                    var entryProperty = entriesProperty.GetArrayElementAtIndex(i);
-                    entryProperty.FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Enabled)).boolValue = true;
-                    entryProperty.FindPropertyRelative(nameof(MeshiaCascadingAvatarMeshSimplifierRendererEntry.Fixed)).boolValue = false;
+                    target.RefreshEntries();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Meshia] Exception while refreshing entries during Reset: {ex}");
                 }
 
-                serializedObject.ApplyModifiedProperties();
+                // Ensure serialized state is updated and mark dirty so changes persist
                 serializedObject.Update();
-
-                SetQualityAll(quality);
                 serializedObject.ApplyModifiedProperties();
+                EditorUtility.SetDirty(target);
             };
             entriesListView.bindItem = (itemElement, index) =>
             {
@@ -1010,6 +1077,589 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
                     targetTriangleCountProperty.intValue = (int)(originalTriangleCount * ratio);
                 }
+            }
+        }
+
+        private static bool IsRendererUsableForOcclusion(Renderer renderer)
+        {
+            return renderer != null && renderer.enabled && renderer.gameObject.activeInHierarchy;
+        }
+
+        private enum OcclusionRenderStateSource
+        {
+            OriginalAvatar,
+            NdmfPreviewProxy,
+        }
+
+        private static bool TryResolveOcclusionPreviewSourceRenderer(
+            Renderer originalRenderer,
+            out Renderer sourceRenderer,
+            out OcclusionRenderStateSource sourceKind)
+        {
+            // Always prefer the NDMF preview proxy renderer for occlusion preview.
+            // This ensures all blendshapes and Modular Avatar shape changers are reflected.
+            bool previewEnabled = MeshiaCascadingAvatarMeshSimplifierPreview.IsEnabled();
+
+            if (previewEnabled)
+            {
+                // Try to resolve the preview proxy renderer.
+                if (MeshiaCascadingAvatarMeshSimplifierPreview.TryGetPreviewRenderer(originalRenderer, out var previewRenderer)
+                    && IsRendererUsableForOcclusion(previewRenderer)
+                    && RendererUtility.GetMesh(previewRenderer) != null)
+                {
+                    sourceRenderer = previewRenderer;
+                    sourceKind = OcclusionRenderStateSource.NdmfPreviewProxy;
+                    return true;
+                }
+                // Fall through to original renderer when the preview proxy is not yet
+                // available.  This is critical: without fallback, ALL renderers would be
+                // skipped when NDMF preview is loading/incomplete, producing zero
+                // occluders and scoring every vertex as fully visible.
+            }
+
+            // Use the original renderer (either preview is disabled, or proxy was
+            // unavailable).  This ensures clothing meshes always participate as occluders.
+            if (IsRendererUsableForOcclusion(originalRenderer)
+                && RendererUtility.GetMesh(originalRenderer) != null)
+            {
+                sourceRenderer = originalRenderer;
+                sourceKind = OcclusionRenderStateSource.OriginalAvatar;
+                return true;
+            }
+
+            sourceRenderer = null!;
+            sourceKind = OcclusionRenderStateSource.OriginalAvatar;
+            return false;
+        }
+
+        private static bool TryBuildWorldSpaceMeshFromRenderer(
+            Renderer sourceRenderer,
+            OcclusionRenderStateSource sourceKind,
+            out Mesh worldMesh)
+        {
+            worldMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+            var sourceMesh = RendererUtility.GetMesh(sourceRenderer);
+            if (sourceMesh == null || sourceMesh.vertexCount == 0)
+            {
+                UnityEngine.Object.DestroyImmediate(worldMesh);
+                worldMesh = null!;
+                return false;
+            }
+
+            // Always try BakeMesh for SMRs first so live blendshape weights and current skinning
+            // are reflected. If the renderer is disabled (e.g., originals hidden by NDMF preview),
+            // we temporarily enable it for BakeMesh and restore afterwards — this ensures we get
+            // the correct deformed geometry rather than falling back to bind-pose sharedMesh which
+            // would place occluder colliders in T-pose instead of the actual avatar pose.
+            bool baked = false;
+            if (sourceRenderer is SkinnedMeshRenderer smr
+                && smr.sharedMesh != null)
+            {
+                bool wasEnabled = smr.enabled;
+                try
+                {
+                    // BakeMesh requires the renderer's bones to be valid but does NOT
+                    // require the renderer to be enabled. However, some Unity versions
+                    // and edge cases produce incorrect results on disabled SMRs.
+                    // Temporarily enabling guarantees correct bone/blendshape evaluation.
+                    if (!wasEnabled)
+                        smr.enabled = true;
+
+                    smr.BakeMesh(worldMesh);
+                    baked = worldMesh.vertexCount > 0;
+                }
+                catch
+                {
+                    baked = false;
+                }
+                finally
+                {
+                    if (!wasEnabled)
+                        smr.enabled = false;
+                }
+            }
+
+            if (!baked)
+            {
+                worldMesh.vertices = sourceMesh.vertices;
+                worldMesh.triangles = sourceMesh.triangles;
+                var srcNormals = sourceMesh.normals;
+                if (srcNormals != null && srcNormals.Length == sourceMesh.vertexCount)
+                    worldMesh.normals = srcNormals;
+            }
+
+            var localToWorld = sourceRenderer.transform.localToWorldMatrix;
+            var verts = worldMesh.vertices;
+            for (int i = 0; i < verts.Length; i++)
+                verts[i] = localToWorld.MultiplyPoint3x4(verts[i]);
+            worldMesh.vertices = verts;
+
+            var normals = worldMesh.normals;
+            if (normals != null && normals.Length == verts.Length)
+            {
+                for (int i = 0; i < normals.Length; i++)
+                    normals[i] = localToWorld.MultiplyVector(normals[i]).normalized;
+                worldMesh.normals = normals;
+            }
+
+            // Always recalculate bounds after transforming vertices to world space.
+            // The baked path had bounds in local space; without this, MeshCollider
+            // and other consumers see stale bounds.
+            worldMesh.RecalculateBounds();
+
+            return true;
+        }
+
+        /// <summary>
+        /// Holds per-renderer world-space MeshCollider objects for occlusion raycasting.
+        /// Includes ALL renderers with valid mesh data on the avatar — even those disabled
+        /// by NDMF preview — so clothing always participates as occluders for the body mesh.
+        /// Deduplicates by resolved source renderer to avoid self-occlusion from proxy/original pairs.
+        /// </summary>
+        private sealed class OcclusionPreviewContext : IDisposable
+        {
+            private struct ColEntry
+            {
+                public Renderer Original;
+                public Renderer Source;
+                public OcclusionRenderStateSource SourceKind;
+                public GameObject TempGo;
+                public Mesh TempMesh;
+                public MeshCollider Collider;
+            }
+
+            private readonly ColEntry[] _entries;
+            public int Count => _entries.Length;
+
+            private OcclusionPreviewContext(ColEntry[] e) { _entries = e; }
+
+            public static OcclusionPreviewContext Build(Renderer[] originalRenderers)
+            {
+                var list = new List<ColEntry>(originalRenderers.Length);
+                // Track resolved source renderers to prevent duplicate colliders when
+                // both an original and its NDMF preview proxy appear in the input list.
+                var usedSources = new HashSet<Renderer>(originalRenderers.Length);
+
+                foreach (var originalRenderer in originalRenderers)
+                {
+                    if (originalRenderer == null)
+                        continue;
+
+                    Renderer sourceRenderer;
+                    OcclusionRenderStateSource sourceKind;
+
+                    if (!TryResolveOcclusionPreviewSourceRenderer(originalRenderer, out sourceRenderer, out sourceKind))
+                    {
+                        // Renderer might be disabled by NDMF preview (originals are hidden
+                        // when proxies take over).  Still include it as an occluder if it
+                        // has valid mesh data — this is critical for clothing to participate
+                        // as occluders when computing body mesh occlusion.
+                        var mesh = RendererUtility.GetMesh(originalRenderer);
+                        if (mesh == null || mesh.vertexCount == 0)
+                            continue;
+                        sourceRenderer = originalRenderer;
+                        sourceKind = OcclusionRenderStateSource.OriginalAvatar;
+                    }
+
+                    // Deduplicate: skip if we've already built a collider from this exact
+                    // source renderer (happens when both original + proxy resolve to the
+                    // same underlying renderer).
+                    if (!usedSources.Add(sourceRenderer))
+                        continue;
+
+                    if (!TryBuildWorldSpaceMeshFromRenderer(sourceRenderer, sourceKind, out var worldMesh))
+                        continue;
+
+                    var go = new GameObject("MeshiaOccluder") { hideFlags = HideFlags.HideAndDontSave };
+                    var col = go.AddComponent<MeshCollider>();
+                    col.sharedMesh = worldMesh;
+                    list.Add(new ColEntry
+                    {
+                        Original = originalRenderer,
+                        Source = sourceRenderer,
+                        SourceKind = sourceKind,
+                        TempGo = go,
+                        TempMesh = worldMesh,
+                        Collider = col,
+                    });
+                }
+                return new OcclusionPreviewContext(list.ToArray());
+            }
+
+            /// <summary>
+            /// Fills <paramref name="buffer"/> with every collider except those belonging to
+            /// <paramref name="originalRenderer"/> and returns the count via <paramref name="count"/>.
+            /// Also excludes entries that share the same source renderer to prevent self-occlusion
+            /// from proxy/original pairs.
+            /// </summary>
+            public void GetExternalColliders(Renderer originalRenderer, MeshCollider[] buffer, out int count)
+            {
+                // Find the source renderer for the target so we can also exclude its proxy/duplicate.
+                Renderer? targetSource = null;
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, originalRenderer))
+                    {
+                        targetSource = e.Source;
+                        break;
+                    }
+                }
+
+                count = 0;
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, originalRenderer))
+                        continue;
+                    // Exclude entries that share the same source (prevents self-occlusion
+                    // when both original and proxy are in the context).
+                    if (targetSource != null && ReferenceEquals(e.Source, targetSource))
+                        continue;
+                    buffer[count++] = e.Collider;
+                }
+            }
+
+            /// <summary>
+            /// Returns clones of all occluder world-space meshes and their labels for debug display.
+            /// The caller is responsible for the lifetime of the returned Mesh objects.
+            /// </summary>
+            public void GetOccluderDebugMeshes(Renderer targetOriginal, out Mesh[] meshes, out string[] labels)
+            {
+                // Find the source renderer for the target so we can exclude self.
+                Renderer? targetSource = null;
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, targetOriginal))
+                    {
+                        targetSource = e.Source;
+                        break;
+                    }
+                }
+
+                var meshList = new List<Mesh>();
+                var labelList = new List<string>();
+                foreach (var e in _entries)
+                {
+                    if (ReferenceEquals(e.Original, targetOriginal))
+                        continue;
+                    if (targetSource != null && ReferenceEquals(e.Source, targetSource))
+                        continue;
+                    if (e.TempMesh == null || e.TempMesh.vertexCount == 0)
+                        continue;
+
+                    meshList.Add(e.TempMesh);
+                    labelList.Add(e.Source != null ? e.Source.name : "Unknown");
+                }
+                meshes = meshList.ToArray();
+                labels = labelList.ToArray();
+            }
+
+            public void Dispose()
+            {
+                foreach (var e in _entries)
+                {
+                    if (e.TempGo != null) UnityEngine.Object.DestroyImmediate(e.TempGo);
+                    if (e.TempMesh != null) UnityEngine.Object.DestroyImmediate(e.TempMesh);
+                }
+            }
+        }
+
+        private static string GetGroupPreviewPrefix(string groupName) => $"mesh::{groupName}::";
+        private static string GetMeshPreviewId(MeshiaCascadingAvatarMeshSimplifierRendererEntry entry)
+            => $"mesh::{entry.CostumeGroup}::{entry.RendererObjectReference.referencePath}";
+
+        private IEnumerable<MeshiaCascadingAvatarMeshSimplifierRendererEntry> EnumerateValidOcclusionEntries(string? groupName = null)
+        {
+            foreach (var entry in Target.Entries)
+            {
+                if (!entry.IsValid(Target) || !entry.Enabled)
+                    continue;
+
+                if (groupName != null && !string.Equals(entry.CostumeGroup, groupName, StringComparison.Ordinal))
+                    continue;
+
+                if (entry.GetTargetRenderer(Target) is not SkinnedMeshRenderer)
+                    continue;
+
+                yield return entry;
+            }
+        }
+
+        private bool TryCreateOcclusionPreviewContext(out OcclusionPreviewContext context)
+        {
+            context = null!;
+            var avatarRoot = Target.transform.parent?.gameObject;
+            if (avatarRoot == null)
+            {
+                Debug.LogWarning("[Meshia] Cannot preview occlusion weights: component must be a child of the avatar root GameObject.");
+                return false;
+            }
+
+            // Build colliders from all ORIGINAL avatar renderers (not NDMF preview proxies).
+            // Each renderer is resolved to either NDMF preview proxy or original source based on
+            // preview state, then converted into a temporary world-space collider mesh.
+            var avatarRenderers = avatarRoot.GetComponentsInChildren<Renderer>(true);
+            context = OcclusionPreviewContext.Build(avatarRenderers);
+
+            if (context.Count == 0)
+            {
+                Debug.LogWarning("[Meshia] Occlusion preview has no resolved renderers. If NDMF preview is enabled, wait for preview to finish generating and try again.");
+                context.Dispose();
+                context = null!;
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool BuildAndStoreOcclusionPreviewForEntry(
+            MeshiaCascadingAvatarMeshSimplifierRendererEntry entry,
+            OcclusionPreviewContext context,
+            bool showOccluderDebugMeshes = false)
+        {
+            if (entry.GetTargetRenderer(Target) is not Renderer originalRenderer)
+                return false;
+
+            if (!TryResolveOcclusionPreviewSourceRenderer(originalRenderer, out var sourceRenderer, out var sourceKind))
+            {
+                Debug.LogWarning($"[Meshia] Could not resolve source renderer for '{originalRenderer.name}' - skipping occlusion preview.");
+                return false;
+            }
+
+            string previewId = GetMeshPreviewId(entry);
+            if (!TryBuildWorldSpaceMeshFromRenderer(sourceRenderer, sourceKind, out var targetWorldMesh))
+            {
+                Debug.LogWarning($"[Meshia] Could not build world-space mesh for '{sourceRenderer.name}' - skipping occlusion preview.");
+                return false;
+            }
+
+            try
+            {
+                // Retrieve external occluder colliders (all resolved source meshes except self).
+                var colliderBuffer = new MeshCollider[context.Count];
+                context.GetExternalColliders(originalRenderer, colliderBuffer, out int colliderCount);
+
+                Debug.Log($"[Meshia] Computing occlusion for '{originalRenderer.name}' (source: {sourceKind}): {targetWorldMesh.vertexCount} verts, {colliderCount} external occluders, strength={Target.OcclusionWeightStrength:F2}");
+
+                // Optionally show occluder debug meshes so the user can verify clothing participation.
+                if (showOccluderDebugMeshes)
+                {
+                    context.GetOccluderDebugMeshes(originalRenderer, out var debugMeshes, out var debugLabels);
+                    OcclusionPreviewRenderer.ShowOccluderDebugMeshes(debugMeshes, debugLabels);
+                }
+
+                // Fibonacci sphere raycasting over the current NDMF preview/avatar state.
+                var weights = OcclusionVertexWeighter.ComputeWeights(
+                    targetWorldMesh, colliderBuffer, colliderCount, Target.OcclusionWeightStrength);
+                OcclusionPreviewRenderer.SetPreviewData(previewId, targetWorldMesh, weights, true);
+                return true;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[Meshia] Failed to compute occlusion preview for '{originalRenderer.name}' (source: {sourceKind}): {e}");
+                return false;
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(targetWorldMesh);
+            }
+        }
+
+        private void DrawOcclusionPreviewControls()
+        {
+            if (!Target.UseOcclusionWeightedSimplification)
+                return;
+
+            EditorGUILayout.Space(4);
+            EditorGUILayout.LabelField("Occlusion Preview Controls", EditorStyles.boldLabel);
+
+            // Color legend help box
+            EditorGUILayout.HelpBox(
+                "Purple/Blue = Visible (preserved, low simplification priority)\n" +
+                "Yellow/Green = Occluded (simplified more aggressively)\n\n" +
+                "Preview creates real GameObjects under 'MeshiaOcclusionPreview' in the Hierarchy.\n" +
+                "The mesh shown is the exact world-space geometry used for raycasting.",
+                MessageType.Info);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Preview All"))
+                {
+                    ComputeAndPreviewOcclusionWeights();
+                }
+                if (GUILayout.Button("Show All"))
+                {
+                    OcclusionPreviewRenderer.SetPreviewEnabledForPrefix("mesh::", true);
+                }
+                if (GUILayout.Button("Hide All"))
+                {
+                    OcclusionPreviewRenderer.SetPreviewEnabledForPrefix("mesh::", false);
+                }
+                if (GUILayout.Button("Clear All"))
+                {
+                    OcclusionPreviewRenderer.ClearPreviewData();
+                }
+            }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Show Occluder Meshes"))
+                {
+                    ShowOccluderDebugMeshes();
+                }
+                if (GUILayout.Button("Hide Occluder Meshes"))
+                {
+                    OcclusionPreviewRenderer.ClearOccluderDebugMeshes();
+                }
+            }
+
+            foreach (var costumeGroup in Target.CostumeGroups)
+            {
+                string groupName = costumeGroup.GroupName;
+                string groupPrefix = GetGroupPreviewPrefix(groupName);
+
+                OcclusionPreviewRenderer.GetPreviewCountsForPrefix(groupPrefix, out int totalGroupPreviews, out int enabledGroupPreviews);
+                bool hasGroupPreview = totalGroupPreviews > 0;
+
+                using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+                {
+                    EditorGUILayout.LabelField(
+                        $"{groupName} (shown {enabledGroupPreviews}/{Mathf.Max(totalGroupPreviews, 0)})",
+                        EditorStyles.boldLabel);
+
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        if (GUILayout.Button("Preview Group"))
+                        {
+                            ComputeAndPreviewOcclusionWeights(groupName);
+                        }
+
+                        using (new EditorGUI.DisabledScope(!hasGroupPreview))
+                        {
+                            if (GUILayout.Button(enabledGroupPreviews > 0 ? "Hide Group" : "Show Group"))
+                            {
+                                OcclusionPreviewRenderer.SetPreviewEnabledForPrefix(groupPrefix, enabledGroupPreviews == 0);
+                            }
+                            if (GUILayout.Button("Clear Group"))
+                            {
+                                OcclusionPreviewRenderer.RemovePreviewDataForPrefix(groupPrefix);
+                            }
+                        }
+                    }
+
+                    foreach (var entry in EnumerateValidOcclusionEntries(groupName))
+                    {
+                        string previewId = GetMeshPreviewId(entry);
+                        bool hasPreview = OcclusionPreviewRenderer.HasPreviewData(previewId);
+                        bool isEnabled = OcclusionPreviewRenderer.IsPreviewEnabled(previewId);
+                        string rendererName = entry.GetTargetRenderer(Target)?.name ?? entry.RendererObjectReference.referencePath;
+
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            GUILayout.Space(12);
+                            EditorGUILayout.LabelField(rendererName, GUILayout.MinWidth(140));
+
+                            if (GUILayout.Button(hasPreview ? "Rebuild" : "Build", GUILayout.Width(60)))
+                            {
+                                ComputeAndPreviewOcclusionWeightsForEntry(entry);
+                            }
+
+                            using (new EditorGUI.DisabledScope(!hasPreview))
+                            {
+                                bool nextEnabled = EditorGUILayout.ToggleLeft("Show", isEnabled, GUILayout.Width(60));
+                                if (nextEnabled != isEnabled)
+                                {
+                                    OcclusionPreviewRenderer.SetPreviewEnabled(previewId, nextEnabled);
+                                }
+                                if (GUILayout.Button("Clear", GUILayout.Width(50)))
+                                {
+                                    OcclusionPreviewRenderer.RemovePreviewData(previewId);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private void ComputeAndPreviewOcclusionWeightsForEntry(MeshiaCascadingAvatarMeshSimplifierRendererEntry entry)
+        {
+            if (!Target.UseOcclusionWeightedSimplification)
+                return;
+
+            // Rebuild must reflect current state; clear old points for this mesh first.
+            OcclusionPreviewRenderer.RemovePreviewData(GetMeshPreviewId(entry));
+
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            using (context)
+                BuildAndStoreOcclusionPreviewForEntry(entry, context);
+        }
+
+        private void ComputeAndPreviewOcclusionWeights(string costumeGroup)
+        {
+            if (!Target.UseOcclusionWeightedSimplification)
+                return;
+
+            // Group rebuild should be a full rerun for that group.
+            OcclusionPreviewRenderer.RemovePreviewDataForPrefix(GetGroupPreviewPrefix(costumeGroup));
+
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            using (context)
+            {
+                foreach (var entry in EnumerateValidOcclusionEntries(costumeGroup))
+                    BuildAndStoreOcclusionPreviewForEntry(entry, context);
+            }
+        }
+
+        /// <summary>
+        /// Computes per-vertex occlusion weights for all valid SkinnedMeshRenderer entries
+        /// and creates preview GameObjects with vertex-colored meshes via <see cref="OcclusionPreviewRenderer"/>.
+        /// </summary>
+        private void ComputeAndPreviewOcclusionWeights()
+        {
+            var target = Target;
+            if (!target.UseOcclusionWeightedSimplification) return;
+
+            OcclusionPreviewRenderer.ClearPreviewData();
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            using (context)
+            {
+                foreach (var entry in EnumerateValidOcclusionEntries())
+                    BuildAndStoreOcclusionPreviewForEntry(entry, context);
+            }
+        }
+
+        /// <summary>
+        /// Shows semi-transparent debug GameObjects for all occluder meshes
+        /// (clothing, accessories) so the user can verify which meshes participate
+        /// in the occlusion calculation.
+        /// </summary>
+        private void ShowOccluderDebugMeshes()
+        {
+            if (!TryCreateOcclusionPreviewContext(out var context))
+                return;
+
+            using (context)
+            {
+                // Pick the first valid entry as the "target" so we can see external occluders.
+                var firstEntry = EnumerateValidOcclusionEntries().GetEnumerator();
+                if (!firstEntry.MoveNext())
+                {
+                    Debug.LogWarning("[Meshia] No valid occlusion entries to show occluders for.");
+                    return;
+                }
+
+                var entry = firstEntry.Current;
+                if (entry.GetTargetRenderer(Target) is not Renderer originalRenderer)
+                    return;
+
+                context.GetOccluderDebugMeshes(originalRenderer, out var debugMeshes, out var debugLabels);
+                OcclusionPreviewRenderer.ShowOccluderDebugMeshes(debugMeshes, debugLabels);
             }
         }
 
