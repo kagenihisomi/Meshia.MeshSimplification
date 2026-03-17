@@ -1142,20 +1142,35 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
 
             // Always try BakeMesh for SMRs first so live blendshape weights and current skinning
-            // are reflected. If it fails (some preview proxies can be partially configured), we
-            // gracefully fall back to shared mesh geometry.
+            // are reflected. If the renderer is disabled (e.g., originals hidden by NDMF preview),
+            // we temporarily enable it for BakeMesh and restore afterwards — this ensures we get
+            // the correct deformed geometry rather than falling back to bind-pose sharedMesh which
+            // would place occluder colliders in T-pose instead of the actual avatar pose.
             bool baked = false;
             if (sourceRenderer is SkinnedMeshRenderer smr
                 && smr.sharedMesh != null)
             {
+                bool wasEnabled = smr.enabled;
                 try
                 {
+                    // BakeMesh requires the renderer's bones to be valid but does NOT
+                    // require the renderer to be enabled. However, some Unity versions
+                    // and edge cases produce incorrect results on disabled SMRs.
+                    // Temporarily enabling guarantees correct bone/blendshape evaluation.
+                    if (!wasEnabled)
+                        smr.enabled = true;
+
                     smr.BakeMesh(worldMesh);
                     baked = worldMesh.vertexCount > 0;
                 }
                 catch
                 {
                     baked = false;
+                }
+                finally
+                {
+                    if (!wasEnabled)
+                        smr.enabled = false;
                 }
             }
 
