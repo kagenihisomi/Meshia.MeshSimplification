@@ -1106,14 +1106,14 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                     sourceKind = OcclusionRenderStateSource.NdmfPreviewProxy;
                     return true;
                 }
-                // If preview is enabled but proxy is not available, do NOT fallback to original renderer.
-                // This prevents mixing preview and original sources, and avoids hacks/generalization.
-                sourceRenderer = null!;
-                sourceKind = OcclusionRenderStateSource.NdmfPreviewProxy;
-                return false;
+                // Fall through to original renderer when the preview proxy is not yet
+                // available.  This is critical: without fallback, ALL renderers would be
+                // skipped when NDMF preview is loading/incomplete, producing zero
+                // occluders and scoring every vertex as fully visible.
             }
 
-            // Only fallback to original renderer if preview is disabled or unavailable.
+            // Use the original renderer (either preview is disabled, or proxy was
+            // unavailable).  This ensures clothing meshes always participate as occluders.
             if (IsRendererUsableForOcclusion(originalRenderer)
                 && RendererUtility.GetMesh(originalRenderer) != null)
             {

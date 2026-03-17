@@ -183,15 +183,43 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
                         var srcMesh = RendererUtility.GetMesh(r);
                         if (srcMesh == null || srcMesh.vertexCount == 0) continue;
 
-                        // Transform static mesh vertices to world space (no BakeMesh – avoids
-                        // any dependency on bone/blend-shape state at build time).
+                        // Build world-space mesh.  For SkinnedMeshRenderers we BakeMesh
+                        // to capture the current deformed state (blendshapes, skinning)
+                        // then transform the baked local-space vertices into world space.
+                        // For static MeshRenderers we use sharedMesh directly.
                         var worldMesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
-                        var verts = srcMesh.vertices;
+
+                        bool baked = false;
+                        if (r is SkinnedMeshRenderer smr && smr.sharedMesh != null)
+                        {
+                            try
+                            {
+                                smr.BakeMesh(worldMesh);
+                                baked = worldMesh.vertexCount > 0;
+                            }
+                            catch
+                            {
+                                // BakeMesh can fail on partially-configured or invalid SMRs;
+                                // fall back to sharedMesh geometry which is still usable as
+                                // an occluder even without deformation.
+                                baked = false;
+                            }
+                        }
+
+                        if (!baked)
+                        {
+                            worldMesh.vertices = srcMesh.vertices;
+                            worldMesh.triangles = srcMesh.triangles;
+                        }
+
                         var l2w = r.transform.localToWorldMatrix;
+                        var verts = worldMesh.vertices;
                         for (int i = 0; i < verts.Length; i++)
                             verts[i] = l2w.MultiplyPoint3x4(verts[i]);
                         worldMesh.vertices = verts;
-                        worldMesh.triangles = srcMesh.triangles;
+
+                        if (!baked)
+                            worldMesh.RecalculateBounds();
 
                         var go = new GameObject("MeshiaOccluder") { hideFlags = HideFlags.HideAndDontSave };
                         var col = go.AddComponent<MeshCollider>();
@@ -227,10 +255,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
         }
 
         /// <summary>
-        /// Builds a world-space static mesh from <paramref name="skinnedMeshRenderer"/>'s
-        /// <c>sharedMesh</c> and computes per-vertex occlusion weights using the pre-built
-        /// <paramref name="occluderSet"/>.  No <c>BakeMesh</c> is called – this is intentional
-        /// so the result is deterministic and independent of editor bone/blend-shape state.
+        /// Builds a world-space mesh from <paramref name="skinnedMeshRenderer"/> and computes
+        /// per-vertex occlusion weights using the pre-built <paramref name="occluderSet"/>.
+        /// Uses <c>BakeMesh</c> to capture the current deformed state (blendshapes, skinning).
         /// </summary>
         private static float[] ComputeOcclusionWeightsForRenderer(
             SkinnedMeshRenderer skinnedMeshRenderer,
@@ -244,17 +271,46 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var worldMesh = new Mesh();
             try
             {
-                var verts = srcMesh.vertices;
-                var normals = srcMesh.normals;
+                // BakeMesh captures skinning + blendshape deformation into local space.
+                bool baked = false;
+                if (skinnedMeshRenderer.sharedMesh != null)
+                {
+                    try
+                    {
+                        skinnedMeshRenderer.BakeMesh(worldMesh);
+                        baked = worldMesh.vertexCount > 0;
+                    }
+                    catch
+                    {
+                        // BakeMesh can fail on partially-configured or invalid SMRs;
+                        // fall back to sharedMesh geometry for the occlusion test.
+                        baked = false;
+                    }
+                }
+
+                if (!baked)
+                {
+                    worldMesh.vertices = srcMesh.vertices;
+                    worldMesh.triangles = srcMesh.triangles;
+                    var srcNormals = srcMesh.normals;
+                    if (srcNormals != null && srcNormals.Length == srcMesh.vertexCount)
+                        worldMesh.normals = srcNormals;
+                }
+
+                // Transform from local space to world space.
                 var l2w = skinnedMeshRenderer.transform.localToWorldMatrix;
+                var verts = worldMesh.vertices;
                 for (int v = 0; v < verts.Length; v++)
                     verts[v] = l2w.MultiplyPoint3x4(verts[v]);
-                for (int n = 0; n < normals.Length; n++)
-                    normals[n] = l2w.MultiplyVector(normals[n]).normalized;
-
                 worldMesh.vertices = verts;
-                worldMesh.normals = normals;
-                worldMesh.triangles = srcMesh.triangles;
+
+                var normals = worldMesh.normals;
+                if (normals != null && normals.Length == verts.Length)
+                {
+                    for (int n = 0; n < normals.Length; n++)
+                        normals[n] = l2w.MultiplyVector(normals[n]).normalized;
+                    worldMesh.normals = normals;
+                }
 
                 var buffer = new MeshCollider[occluderSet.Count];
                 occluderSet.GetExternalColliders(skinnedMeshRenderer, buffer, out int count);

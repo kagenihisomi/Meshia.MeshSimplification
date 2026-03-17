@@ -1,6 +1,7 @@
 #nullable enable
 #if ENABLE_MODULAR_AVATAR
 
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace Meshia.MeshSimplification.Ndmf.Editor
@@ -15,6 +16,9 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
     /// guard also contributes, enabling per-mesh self-occlusion (e.g. body geometry hidden inside
     /// clothing on a single SkinnedMeshRenderer).
     ///
+    /// After scoring, a triangle-connectivity-based smoothing pass is applied to produce
+    /// smooth weight gradients across the mesh surface.
+    ///
     /// Occluded vertices receive a higher simplification weight so the mesh simplifier collapses
     /// them more aggressively than visible vertices.
     /// </summary>
@@ -25,13 +29,20 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
 
         // A self-collider hit only counts as occlusion when it is further away than this
         // distance, preventing the vertex's own adjacent faces from registering as blockers.
-        private const float SelfMinHitDist = 0.002f;
+        // 1cm avoids noise from neighbouring triangles on the same mesh.
+        private const float SelfMinHitDist = 0.01f;
 
         // Default number of Fibonacci sphere sample directions.
-        private const int DefaultRayCount = 32;
+        // 64 directions gives ~1.6% resolution per step which is smooth enough for
+        // visible heatmaps while keeping computation time reasonable.
+        private const int DefaultRayCount = 64;
 
-        // Default maximum ray distance for occlusion tests (0.15 m – avatar scale).
-        private const float DefaultMaxDist = 0.15f;
+        // Default maximum ray distance for occlusion tests (0.5 m – avatar scale).
+        // Covers loose clothing, capes, skirts, and most accessories.
+        private const float DefaultMaxDist = 0.5f;
+
+        // Number of Laplacian smoothing iterations applied to raw scores.
+        private const int SmoothIterations = 3;
 
         // Cached Fibonacci directions for the default ray count (immutable, safe for sharing).
         private static Vector3[]? s_cachedDirs;
@@ -91,7 +102,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             var vertices = worldSpaceMesh.vertices;
             var normals = worldSpaceMesh.normals;
             int vertexCount = vertices.Length;
-            float[] weights = new float[vertexCount];
+            float[] rawScores = new float[vertexCount];
 
             float maxWeight = Mathf.Lerp(1f, 10f, occlusionWeightStrength);
             int clampedCount = Mathf.Clamp(externalOccluderCount, 0, externalOccluderColliders.Length);
@@ -103,13 +114,24 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             for (int i = 0; i < vertexCount; i++)
             {
                 Vector3 normal = i < normals.Length ? normals[i] : Vector3.zero;
-                float score = ComputeVertexOcclusionScore(
+                rawScores[i] = ComputeVertexOcclusionScore(
                     vertices[i], normal,
                     directions,
                     externalOccluderColliders, clampedCount,
                     selfOccluder.Collider,
                     maxRayDistance);
-                weights[i] = Mathf.Lerp(1f, maxWeight, score);
+            }
+
+            // Smooth the raw scores using triangle connectivity to produce gradual
+            // gradients instead of noisy per-vertex scores.
+            var triangles = worldSpaceMesh.triangles;
+            float[] smoothed = SmoothScores(rawScores, triangles, vertexCount, SmoothIterations);
+
+            // Convert smoothed scores to simplification weights.
+            float[] weights = new float[vertexCount];
+            for (int i = 0; i < vertexCount; i++)
+            {
+                weights[i] = Mathf.Lerp(1f, maxWeight, smoothed[i]);
             }
 
             return weights;
@@ -202,6 +224,70 @@ namespace Meshia.MeshSimplification.Ndmf.Editor
             }
 
             return blocked / (float)total;
+        }
+
+        // ──────────────────────────────────────────────────────────────────────────────
+        //  Laplacian smoothing on triangle connectivity
+        // ──────────────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Applies iterative Laplacian smoothing: each vertex's score is replaced by the
+        /// average of its 1-ring neighbours.  This produces smooth gradients from fully-
+        /// occluded to fully-visible regions instead of noisy per-vertex scores.
+        /// </summary>
+        private static float[] SmoothScores(float[] scores, int[] triangles, int vertexCount, int iterations)
+        {
+            if (triangles == null || triangles.Length < 3 || vertexCount == 0)
+                return scores;
+
+            // Build adjacency: for each vertex, collect the set of neighbour vertices.
+            var neighbours = new HashSet<int>[vertexCount];
+            for (int i = 0; i < vertexCount; i++)
+                neighbours[i] = new HashSet<int>();
+
+            for (int t = 0; t < triangles.Length; t += 3)
+            {
+                int a = triangles[t], b = triangles[t + 1], c = triangles[t + 2];
+                if (a < vertexCount && b < vertexCount && c < vertexCount)
+                {
+                    AddNeighbour(neighbours, a, b);
+                    AddNeighbour(neighbours, a, c);
+                    AddNeighbour(neighbours, b, c);
+                }
+            }
+
+            float[] src = (float[])scores.Clone();
+            float[] dst = new float[vertexCount];
+
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                for (int v = 0; v < vertexCount; v++)
+                {
+                    var nbs = neighbours[v];
+                    if (nbs.Count == 0)
+                    {
+                        dst[v] = src[v];
+                        continue;
+                    }
+
+                    // Average of self + all neighbours (umbrella operator)
+                    float sum = src[v];
+                    foreach (int n in nbs)
+                        sum += src[n];
+                    dst[v] = sum / (nbs.Count + 1);
+                }
+
+                // Swap buffers
+                (src, dst) = (dst, src);
+            }
+
+            return src;
+        }
+
+        private static void AddNeighbour(HashSet<int>[] neighbours, int a, int b)
+        {
+            neighbours[a].Add(b);
+            neighbours[b].Add(a);
         }
 
         // ──────────────────────────────────────────────────────────────────────────────
