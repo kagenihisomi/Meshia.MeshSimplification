@@ -205,6 +205,8 @@ namespace Meshia.MeshSimplification.Ndmf
         public int TargetTriangleCount;
         public MeshSimplifierOptions Options = MeshSimplifierOptions.Default;
         public ulong PreserveBorderEdgesBones =
+            (1ul << (int)HumanBodyBones.LeftHand) |
+            (1ul << (int)HumanBodyBones.RightHand) |
             (1ul << (int)HumanBodyBones.LeftThumbProximal) |
             (1ul << (int)HumanBodyBones.LeftThumbIntermediate) |
             (1ul << (int)HumanBodyBones.LeftThumbDistal) |
