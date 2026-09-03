@@ -67,6 +67,7 @@ namespace Meshia.MeshSimplification
         public MeshSimplificationTarget SimplificationTarget;
         private int VertexCount;
         private int TriangleCount;
+        [ReadOnly] public NativeArray<float> VertexWeights;
         MergeFactory MergeFactory => new()
         {
             VertexPositionBuffer = VertexPositionBuffer,
@@ -80,6 +81,7 @@ namespace Meshia.MeshSimplification
             PreserveBorderEdges = Options.PreserveBorderEdges,
             PreserveSurfaceCurvature = Options.PreserveSurfaceCurvature,
 
+            VertexWeights = VertexWeights
         };
 
         PreservedVertexPredicator PreservedVertexPredicator => new()
@@ -280,7 +282,7 @@ namespace Meshia.MeshSimplification
         }
 
         readonly bool IsDiscardedVertex(int vertex) => DiscardedVertex.IsSet(vertex);
-        
+
         void DiscardVertex(int vertex)
         {
             if (!IsDiscardedVertex(vertex))

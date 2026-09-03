@@ -14,6 +14,25 @@ using Unity.Mathematics;
 
 namespace Meshia.MeshSimplification.Ndmf
 {
+    /// <summary>
+    /// Determines how the triangle budget is distributed across renderers within a costume group.
+    /// </summary>
+    [Serializable]
+    public enum BudgetAllocationStrategy
+    {
+        /// <summary>
+        /// Each renderer receives a share proportional to its original triangle count.
+        /// This is the existing behaviour.
+        /// </summary>
+        Even = 0,
+
+        /// <summary>
+        /// Renderers that are more likely to be occluded by other renderers at build-time
+        /// receive a smaller triangle budget. Visible renderers keep more triangles.
+        /// </summary>
+        OcclusionBased = 1,
+    }
+
     [Serializable]
     public class CostumeGroup
     {
@@ -34,6 +53,18 @@ namespace Meshia.MeshSimplification.Ndmf
         public bool AutoAdjustEnabled = true;
         public List<CostumeGroup> CostumeGroups = new();
         public int MinimumTriangleThreshold = 500;
+        public BudgetAllocationStrategy AllocationStrategy = BudgetAllocationStrategy.Even;
+
+        /// <summary>
+        /// When using OcclusionBased strategy, this controls how aggressively occluded
+        /// renderers are down-budgeted. Range [0, 1]. 0 = no effect, 1 = maximum reduction.
+        /// </summary>
+        [Range(0f, 1f)]
+        public float OcclusionAggressiveness = 0.6f;
+
+        /// <summary>Internal: cached visibility scores per renderer path, computed by the editor.</summary>
+        [NonSerialized]
+        public Dictionary<string, float> CachedVisibilityScores = new();
 
         public void RefreshEntries()
         {

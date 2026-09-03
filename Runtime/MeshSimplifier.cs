@@ -37,6 +37,10 @@ namespace Meshia.MeshSimplification
         NativeList<float> VertexBlendWeightBuffer;
         NativeList<uint> VertexBlendIndicesBuffer;
 
+        // Per-vertex occlusion/importance weights (optional). Always created so jobs can be scheduled
+        // without uninitialized native container fields.
+        NativeList<float> VertexWeights;
+
         NativeList<uint> VertexContainingSubMeshIndices;
 
         NativeList<ErrorQuadric> VertexErrorQuadrics;
@@ -68,7 +72,7 @@ namespace Meshia.MeshSimplification
         /// <param name="options">The options for this mesh simplification.</param>
         /// <param name="destination">The destination to write simplified mesh.</param>
         /// <remarks>To process multiple meshes at once, use <see cref="SimplifyBatch(IReadOnlyList{ValueTuple{Mesh, MeshSimplificationTarget, MeshSimplifierOptions, Mesh}})"/> instead.</remarks>
-        public static void Simplify(Mesh mesh, MeshSimplificationTarget target, MeshSimplifierOptions options, Mesh destination) 
+        public static void Simplify(Mesh mesh, MeshSimplificationTarget target, MeshSimplifierOptions options, Mesh destination)
             => Simplify(mesh, target, options, null, destination);
         /// <summary>
         /// Simplifies the given <paramref name="mesh"/> and writes the result to <paramref name="destination"/>.
@@ -123,7 +127,7 @@ namespace Meshia.MeshSimplification
             }
             simplifiedBlendShapes.Dispose();
         }
-        public static void SimplifyBatch(IReadOnlyList<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, Mesh Destination)> parameters) 
+        public static void SimplifyBatch(IReadOnlyList<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, Mesh Destination)> parameters)
             => SimplifyBatch(parameters.Select<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, Mesh Destination), (Mesh, MeshSimplificationTarget, MeshSimplifierOptions, BitArray?, Mesh)>(p => (p.Mesh, p.Target, p.Options, null, p.Destination)).ToList());
 
         public static void SimplifyBatch(IReadOnlyList<(Mesh Mesh, MeshSimplificationTarget Target, MeshSimplifierOptions Options, BitArray? PreserveBorderEdgesBoneIndices, Mesh Destination)> parameters)
@@ -227,7 +231,7 @@ namespace Meshia.MeshSimplification
             var meshSimplifier = new MeshSimplifier(allocator);
 
             NativeBitArray nativePreserveBorderEdgesBoneIndices = new(preserveBorderEdgesBoneIndices?.Length ?? 0, allocator, NativeArrayOptions.UninitializedMemory);
-            if(preserveBorderEdgesBoneIndices is not null)
+            if (preserveBorderEdgesBoneIndices is not null)
             {
                 for (int i = 0; i < preserveBorderEdgesBoneIndices.Length; i++)
                 {
@@ -354,6 +358,8 @@ namespace Meshia.MeshSimplification
             VertexBlendWeightBuffer = new(allocator);
             VertexBlendIndicesBuffer = new(allocator);
 
+            VertexWeights = new(allocator);
+
             VertexContainingSubMeshIndices = new(allocator);
 
             VertexErrorQuadrics = new(allocator);
@@ -395,14 +401,14 @@ namespace Meshia.MeshSimplification
             preserveBorderEdgesBoneIndices.Dispose(jobHandle);
             return jobHandle;
         }
-        
+
         /// <summary>
-         /// Creates and schedules a job that will load mesh data from the <paramref name="meshData"/> into this <see cref="MeshSimplifier"/>.
-         /// </summary>
-         /// <param name="meshData">The mesh data to load.</param>
-         /// <param name="options">The options for this mesh simplification.</param>
-         /// <param name="dependency">The handle of a job which the new job will depend upon.</param>
-         /// <returns>The handle of a new job that will load mesh data from the <paramref name="meshData"/> into this <see cref="MeshSimplifier"/>.</returns>
+        /// Creates and schedules a job that will load mesh data from the <paramref name="meshData"/> into this <see cref="MeshSimplifier"/>.
+        /// </summary>
+        /// <param name="meshData">The mesh data to load.</param>
+        /// <param name="options">The options for this mesh simplification.</param>
+        /// <param name="dependency">The handle of a job which the new job will depend upon.</param>
+        /// <returns>The handle of a new job that will load mesh data from the <paramref name="meshData"/> into this <see cref="MeshSimplifier"/>.</returns>
         public JobHandle ScheduleLoadMeshData(Mesh.MeshData meshData, MeshSimplifierOptions options, NativeBitArray preserveBorderEdgesBoneIndices, JobHandle dependency = default)
         {
             Options = options;
@@ -594,6 +600,7 @@ namespace Meshia.MeshSimplification
                 VertexMerges = VertexMerges,
                 PreserveBorderEdgesBoneIndices = preserveBorderEdgesBoneIndices,
                 SmartLinks = SmartLinks,
+                VertexWeights = VertexWeights.AsDeferredJobArray(),
             }.Schedule(dependency);
         }
 
@@ -661,9 +668,9 @@ namespace Meshia.MeshSimplification
 
                 VertexTexCoord6Buffer.Dispose(inputDeps),
                 VertexTexCoord7Buffer.Dispose(inputDeps),
-
                 VertexBlendWeightBuffer.Dispose(inputDeps),
                 VertexBlendIndicesBuffer.Dispose(inputDeps),
+                VertexWeights.Dispose(inputDeps),
 
                 VertexContainingSubMeshIndices.Dispose(inputDeps),
 
@@ -702,6 +709,7 @@ namespace Meshia.MeshSimplification
 
             VertexBlendWeightBuffer.Dispose();
             VertexBlendIndicesBuffer.Dispose();
+            VertexWeights.Dispose();
 
             VertexContainingSubMeshIndices.Dispose();
 
@@ -1022,11 +1030,12 @@ namespace Meshia.MeshSimplification
                 VertexIsBorderEdgeBits = VertexIsBorderEdgeBits,
                 Edges = edges.AsDeferredJobArray(),
                 UnorderedDirtyVertexMerges = unorderedDirtyVertexMerges.AsDeferredJobArray(),
-                
+
                 PreserveBorderEdges = Options.PreserveBorderEdges,
                 PreserveSurfaceCurvature = Options.PreserveSurfaceCurvature,
                 VertexBlendIndicesBuffer = VertexBlendIndicesBuffer.AsDeferredJobArray(),
                 PreserveBorderEdgesBoneIndices = preserveBorderEdgesBoneIndices,
+                VertexWeights = VertexWeights.AsDeferredJobArray(),
             }.Schedule(edges, JobsUtility.CacheLineSize,
             stackalloc[]
             {
