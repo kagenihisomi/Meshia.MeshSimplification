@@ -15,6 +15,7 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
         where TDerived : MeshiaMeshSimplifierPreviewBase<TDerived>
     {
         public static readonly Dictionary<Renderer, (int proxy, int simplified)> TriangleCountCache = new();
+        private static readonly Dictionary<Renderer, Mesh> ActiveNodeMeshByRenderer = new();
 
         public static TogglablePreviewNode PreviewControlNode { get; } = TogglablePreviewNode.Create(
                 () => typeof(TDerived).Name,
@@ -53,9 +54,47 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
                 throw;
             }
 
-            TriangleCountCache[original] = (proxyMesh.GetTriangleCount(), simplifiedMesh.GetTriangleCount());
+            PruneDestroyedRenderers();
+            if (original != null)
+            {
+                TriangleCountCache[original] = (proxyMesh.GetTriangleCount(), simplifiedMesh.GetTriangleCount());
+                ActiveNodeMeshByRenderer[original] = simplifiedMesh;
+            }
          
-            return new NdmfMeshSimplifierPreviewNode(simplifiedMesh);
+            return new NdmfMeshSimplifierPreviewNode(original, simplifiedMesh, OnNodeDisposed);
+        }
+
+        private static void OnNodeDisposed(Renderer? original, Mesh simplifiedMesh)
+        {
+            if (original != null &&
+                ActiveNodeMeshByRenderer.TryGetValue(original, out var currentMesh) &&
+                ReferenceEquals(currentMesh, simplifiedMesh))
+            {
+                ActiveNodeMeshByRenderer.Remove(original);
+                TriangleCountCache.Remove(original);
+            }
+            PruneDestroyedRenderers();
+        }
+
+        private static void PruneDestroyedRenderers()
+        {
+            List<Renderer>? dead = null;
+            foreach (var key in TriangleCountCache.Keys)
+            {
+                if (key == null)
+                {
+                    dead ??= new List<Renderer>();
+                    dead.Add(key);
+                }
+            }
+            if (dead != null)
+            {
+                foreach (var key in dead)
+                {
+                    TriangleCountCache.Remove(key);
+                    ActiveNodeMeshByRenderer.Remove(key);
+                }
+            }
         }
 
         protected abstract (MeshSimplificationTarget, MeshSimplifierOptions, BitArray?) QueryTarget(ComputeContext context, RenderGroup group, Renderer original, Renderer proxy);
@@ -64,11 +103,15 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
     internal class NdmfMeshSimplifierPreviewNode : IRenderFilterNode
     {
         public RenderAspects WhatChanged => RenderAspects.Mesh;
+        private readonly Renderer? _original;
         private readonly Mesh _simplifiedMesh;
+        private readonly Action<Renderer?, Mesh>? _onDispose;
 
-        public NdmfMeshSimplifierPreviewNode(Mesh mesh)
+        public NdmfMeshSimplifierPreviewNode(Renderer? original, Mesh mesh, Action<Renderer?, Mesh>? onDispose = null)
         {
+            _original = original;
             _simplifiedMesh = mesh;
+            _onDispose = onDispose;
         }
 
         public void OnFrame(Renderer original, Renderer proxy)
@@ -76,6 +119,10 @@ namespace Meshia.MeshSimplification.Ndmf.Editor.Preview
             RendererUtility.SetMesh(proxy, _simplifiedMesh);
         }
 
-        void IDisposable.Dispose() => UnityEngine.Object.DestroyImmediate(_simplifiedMesh);
+        void IDisposable.Dispose()
+        {
+            _onDispose?.Invoke(_original, _simplifiedMesh);
+            UnityEngine.Object.DestroyImmediate(_simplifiedMesh);
+        }
     }
 }
